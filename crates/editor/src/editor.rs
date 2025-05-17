@@ -14,6 +14,7 @@
 //! If you're looking to improve Vim mode, you should check out Vim crate that wraps Editor and overrides its behavior.
 pub mod actions;
 mod blink_manager;
+mod bracket_pair_colorization;
 mod clangd_ext;
 mod code_context_menus;
 pub mod display_map;
@@ -80,6 +81,7 @@ use fuzzy::StringMatchCandidate;
 
 use ::git::blame::BlameEntry;
 use ::git::{Restore, blame::ParsedCommitMessage};
+use bracket_pair_colorization::colorize_bracket_pairs;
 use code_context_menus::{
     AvailableCodeAction, CodeActionContents, CodeActionsItem, CodeActionsMenu, CodeContextMenu,
     CompletionsMenu, ContextMenuOrigin,
@@ -95,7 +97,7 @@ use gpui::{
     UTF16Selection, UnderlineStyle, UniformListScrollHandle, WeakEntity, WeakFocusHandle, Window,
     div, impl_actions, point, prelude::*, pulsating_between, px, relative, size,
 };
-use highlight_matching_bracket::refresh_matching_bracket_highlights;
+// use highlight_matching_bracket::refresh_matching_bracket_highlights;
 use hover_links::{HoverLink, HoveredLinkState, InlayHighlight, find_file};
 pub use hover_popover::hover_markdown_style;
 use hover_popover::{HoverState, hide_hover};
@@ -2720,10 +2722,12 @@ impl Editor {
             {
                 self.available_code_actions.take();
             }
+            println!("qweqweqweqwe");
             self.refresh_code_actions(window, cx);
             self.refresh_document_highlights(cx);
             self.refresh_selected_text_highlights(false, window, cx);
-            refresh_matching_bracket_highlights(self, window, cx);
+            // refresh_matching_bracket_highlights(self, window, cx);
+            colorize_bracket_pairs(self, window, cx);
             self.update_visible_inline_completion(window, cx);
             self.edit_prediction_requires_modifier_in_indent_conflict = true;
             linked_editing_ranges::refresh_linked_ranges(self, window, cx);
@@ -18155,7 +18159,9 @@ impl Editor {
                 self.refresh_active_diagnostics(cx);
                 self.refresh_code_actions(window, cx);
                 self.refresh_selected_text_highlights(true, window, cx);
-                refresh_matching_bracket_highlights(self, window, cx);
+                // refresh_matching_bracket_highlights(self, window, cx);
+                println!("12312312321332312");
+                colorize_bracket_pairs(self, window, cx);
                 if self.has_active_inline_completion() {
                     self.update_visible_inline_completion(window, cx);
                 }
@@ -18353,6 +18359,10 @@ impl Editor {
             )),
             cx,
         );
+
+        println!("lalalala");
+
+        colorize_bracket_pairs(self, window, cx);
 
         let old_cursor_shape = self.cursor_shape;
 

@@ -41,7 +41,11 @@ impl RenderOnce for EditorSettingsControls {
                     .child(BufferFontSizeControl)
                     .child(BufferFontLigaturesControl),
             )
-            .child(SettingsGroup::new("Editor").child(InlineGitBlameControl))
+            .child(
+                SettingsGroup::new("Editor")
+                    .child(InlineGitBlameControl)
+                    .child(BracketPairColorizationControl),
+            )
             .child(
                 SettingsGroup::new("Gutter").child(
                     h_flex()
@@ -312,6 +316,60 @@ impl RenderOnce for InlineGitBlameControl {
 
         CheckboxWithLabel::new(
             "inline-git-blame",
+            Label::new(self.name()),
+            value.into(),
+            |selection, _, cx| {
+                Self::write(
+                    match selection {
+                        ToggleState::Selected => true,
+                        ToggleState::Unselected | ToggleState::Indeterminate => false,
+                    },
+                    cx,
+                );
+            },
+        )
+    }
+}
+
+#[derive(IntoElement)]
+struct BracketPairColorizationControl;
+
+impl EditableSettingControl for BracketPairColorizationControl {
+    type Value = bool;
+    type Settings = EditorSettings;
+
+    fn name(&self) -> SharedString {
+        "Colorize Bracket Pairs".into()
+    }
+
+    fn read(cx: &App) -> Self::Value {
+        let settings = EditorSettings::get_global(cx);
+        settings.bracket_pair_colorization.enabled
+    }
+
+    fn apply(
+        settings: &mut <Self::Settings as Settings>::FileContent,
+        value: Self::Value,
+        _cx: &App,
+    ) {
+        if let Some(bracket_settings) = settings.bracket_pair_colorization.as_mut() {
+            bracket_settings.enabled = Some(value);
+        } else {
+            settings.bracket_pair_colorization =
+                Some(crate::editor_settings::BracketPairColorizationContent {
+                    enabled: Some(value),
+                    ..Default::default()
+                });
+        }
+    }
+}
+
+impl RenderOnce for BracketPairColorizationControl {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let value = Self::read(cx);
+
+        CheckboxWithLabel::new(
+            "bracket-pair-colorization",
             Label::new(self.name()),
             value.into(),
             |selection, _, cx| {

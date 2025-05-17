@@ -19,6 +19,8 @@ pub struct EditorSettings {
     pub scrollbar: Scrollbar,
     pub minimap: Minimap,
     pub gutter: Gutter,
+    #[serde(default)]
+    pub bracket_pair_colorization: BracketPairColorization,
     pub scroll_beyond_last_line: ScrollBeyondLastLine,
     pub vertical_scroll_margin: f32,
     pub autoscroll_on_clicks: bool,
@@ -148,6 +150,27 @@ pub struct Gutter {
     pub runnables: bool,
     pub breakpoints: bool,
     pub folds: bool,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, JsonSchema)]
+pub struct BracketPairColorization {
+    /// Enable bracket pair colorization
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Colors to use for bracket pairs
+    #[serde(default = "default_bracket_colors")]
+    pub colors: Vec<String>,
+}
+
+fn default_bracket_colors() -> Vec<String> {
+    vec![
+        "#e91e63".to_string(), // Pink
+        "#2196f3".to_string(), // Blue
+        "#4caf50".to_string(), // Green
+        "#ff9800".to_string(), // Orange
+        "#9c27b0".to_string(), // Purple
+        "#00bcd4".to_string(), // Cyan
+    ]
 }
 
 /// When to show the scrollbar in the editor.
@@ -334,6 +357,10 @@ pub enum SnippetSortOrder {
 #[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct EditorSettingsContent {
+    /// Whether to colorize matching bracket pairs with different colors
+    ///
+    /// Default: false
+    pub bracket_pair_colorization: Option<BracketPairColorizationContent>,
     /// Whether the cursor blinks in the editor.
     ///
     /// Default: true
@@ -595,6 +622,17 @@ pub struct GutterContent {
     ///
     /// Default: true
     pub folds: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+pub struct BracketPairColorizationContent {
+    /// Enable bracket pair colorization
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+
+    /// Colors to use for bracket pairs
+    pub colors: Option<Vec<String>>,
 }
 
 impl EditorSettings {

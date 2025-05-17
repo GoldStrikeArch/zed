@@ -1,5 +1,6 @@
-use crate::{Editor, EditorSettings};
+use crate::{Editor, EditorSettings, RangeToAnchorExt};
 use gpui::{Context, Hsla, Window};
+use multi_buffer::Anchor as MultiBufferAnchor;
 use settings::Settings;
 use std::{
     cmp::Ordering,
@@ -8,9 +9,10 @@ use std::{
     ops::Range,
     time::{Duration, Instant},
 };
-use text::Anchor;
+use theme::ThemeColors;
 
 /// Module for colorizing matching bracket pairs with different colors.
+///
 /// Implementation inspired by VS Code's bracket pair colorization, which
 /// colorizes brackets by their nesting level to make it easier to match
 /// opening and closing brackets.
@@ -556,14 +558,18 @@ pub fn colorize_bracket_pairs(editor: &mut Editor, window: &mut Window, cx: &mut
     // Clear existing bracket pair highlights
     editor.clear_background_highlights::<BracketPairColorization>(cx);
 
-    // Check if the feature is enabled in settings
-    let settings = EditorSettings::get_global(cx);
-    if !settings.bracket_pair_colorization.enabled {
+    // Check if the feature is enabled in settings and get bracket colors
+    let (enabled, bracket_colors) = {
+        let settings = EditorSettings::get_global(cx);
+        (
+            settings.bracket_pair_colorization.enabled,
+            settings.bracket_pair_colorization.colors.clone(),
+        )
+    };
+    if !enabled {
         return;
     }
-
-    // Get bracket colors from settings
-    let bracket_colors = &settings.bracket_pair_colorization.colors;
+    let bracket_colors = bracket_colors;
     if bracket_colors.is_empty() {
         return;
     }
@@ -571,7 +577,6 @@ pub fn colorize_bracket_pairs(editor: &mut Editor, window: &mut Window, cx: &mut
     // Get the current editor state
     let snapshot = editor.snapshot(window, cx);
     let buffer_text = snapshot.buffer_snapshot.text();
-    let buffer_id = buffer_text.len(); // Use length as a simple ID
 
     // Get visible range to limit the brackets we highlight
     let visible_range = {
@@ -583,7 +588,10 @@ pub fn colorize_bracket_pairs(editor: &mut Editor, window: &mut Window, cx: &mut
 
         start_offset..end_offset
     };
-    let buffer_id = buffer_text.len(); // Use text length as a simple ID
+
+    // Create a unique identifier for this buffer state
+    let buffer_id = buffer_text.len(); // Use text length as the cache key
+
     let mut ast = BRACKET_AST_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
 
@@ -616,44 +624,88 @@ pub fn colorize_bracket_pairs(editor: &mut Editor, window: &mut Window, cx: &mut
             // Choose color based on nesting level
             let color_index = nesting_level % bracket_colors.len();
 
-            // Get the points for these offsets
-            let start_point = snapshot.buffer_snapshot.point_for_offset(range.start);
-            let end_point = snapshot.buffer_snapshot.point_for_offset(range.end);
+            // Convert the range offsets to a range that can be converted to anchors
+            let range = range.start..range.end;
+            let anchor_range = range.to_anchors(&snapshot.buffer_snapshot);
 
-            // Convert to multi_buffer anchors
-            let start_anchor = snapshot.buffer_snapshot.anchor_before_point(start_point);
-            let end_anchor = snapshot.buffer_snapshot.anchor_before_point(end_point);
-
-            (
-                Range {
-                    start: start_anchor,
-                    end: end_anchor,
-                },
-                color_index,
-            )
+            (anchor_range, color_index)
         })
         .collect();
 
     // Group by color for more efficient highlight application
-    let mut by_color: HashMap<usize, Vec<Range<Anchor>>> = HashMap::new();
+    let mut by_color: HashMap<usize, Vec<Range<MultiBufferAnchor>>> = HashMap::new();
     for (range, color_index) in highlight_ranges {
         by_color.entry(color_index).or_default().push(range);
     }
 
     // Apply highlights for each color group
     for (color_index, ranges) in by_color {
-        let color_str = &bracket_colors[color_index];
+        // Choose color function based on the nesting level
+        let color_fn = match color_index % 6 {
+            0 => bracket_color_red,
+            1 => bracket_color_green,
+            2 => bracket_color_blue,
+            3 => bracket_color_orange,
+            4 => bracket_color_purple,
+            _ => bracket_color_cyan,
+        };
 
-        // Parse the color string into an Hsla value
-        let color_value = gpui::color::parse_color(color_str)
-            .map(|color| gpui::Hsla { a: 0.3, ..color })
-            .unwrap_or_else(|| Hsla::default());
+        editor.highlight_background::<BracketPairColorization>(&ranges, color_fn, cx);
+    }
+}
 
-        editor.highlight_background::<BracketPairColorization>(
-            &ranges,
-            move |_theme| color_value,
-            cx,
-        );
+// Static color functions for bracket pair highlighting
+fn bracket_color_red(_theme: &ThemeColors) -> Hsla {
+    Hsla {
+        h: 0.0,
+        s: 0.7,
+        l: 0.6,
+        a: 0.3,
+    }
+}
+
+fn bracket_color_green(_theme: &ThemeColors) -> Hsla {
+    Hsla {
+        h: 0.33,
+        s: 0.7,
+        l: 0.6,
+        a: 0.3,
+    }
+}
+
+fn bracket_color_blue(_theme: &ThemeColors) -> Hsla {
+    Hsla {
+        h: 0.66,
+        s: 0.7,
+        l: 0.6,
+        a: 0.3,
+    }
+}
+
+fn bracket_color_orange(_theme: &ThemeColors) -> Hsla {
+    Hsla {
+        h: 0.16,
+        s: 0.7,
+        l: 0.6,
+        a: 0.3,
+    }
+}
+
+fn bracket_color_purple(_theme: &ThemeColors) -> Hsla {
+    Hsla {
+        h: 0.83,
+        s: 0.7,
+        l: 0.6,
+        a: 0.3,
+    }
+}
+
+fn bracket_color_cyan(_theme: &ThemeColors) -> Hsla {
+    Hsla {
+        h: 0.5,
+        s: 0.7,
+        l: 0.6,
+        a: 0.3,
     }
 }
 

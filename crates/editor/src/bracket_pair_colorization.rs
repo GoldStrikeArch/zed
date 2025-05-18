@@ -1,781 +1,191 @@
-use crate::{Editor, EditorSettings, RangeToAnchorExt};
-use gpui::{Context, Hsla, Window};
-use multi_buffer::Anchor as MultiBufferAnchor;
-use settings::Settings;
 use std::{
-    cmp::Ordering,
-    collections::HashMap,
-    hash::{Hash, Hasher},
+    collections::{HashMap, VecDeque},
     ops::Range,
-    time::{Duration, Instant},
 };
-use theme::ThemeColors;
 
-use std::sync::{LazyLock, Mutex as MutexQwe};
+use language::{BracketPair, BufferSnapshot};
+use tree_sitter::{QueryCursor, StreamingIterator}; // Assuming this is zed_core::RopeExt
 
-static ARRAY_2: LazyLock<MutexQwe<Vec<u8>>> = LazyLock::new(|| MutexQwe::new(vec![]));
+// Number of distinct colors to cycle through for bracket pairs.
+pub const NUM_BRACKET_COLORS: usize = 6;
 
-fn do_a_call() {
-    ARRAY_2.lock().unwrap().push(1);
+// Information about an encountered open bracket.
+#[derive(Debug)]
+struct OpenBracketInfo {
+    // The text of the opening bracket (e.g., "(", "{").
+    opener_text: String,
+    // The color index assigned to this bracket.
+    color_index: usize,
 }
 
-/// Module for colorizing matching bracket pairs with different colors.
-///
-/// Implementation inspired by VS Code's bracket pair colorization, which
-/// colorizes brackets by their nesting level to make it easier to match
-/// opening and closing brackets.
-///
-/// This implementation uses an efficient AST-based approach with length annotations
-/// to ensure good performance even on very large files with many bracket pairs.
-/// The data structure avoids storing absolute positions and instead tracks relative
-/// lengths, making it efficient for incremental updates.
-
-/// Private type used for background highlight identification
-enum BracketPairColorization {}
-
-/// Range wrapper that implements Eq and Hash for use as HashMap key
-#[derive(Debug, Clone)]
-struct RangeKey {
-    start: usize,
-    end: usize,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BracketOccurrence {
+    range: Range<usize>,
+    text: String,
+    is_open: bool,
+    // Used for tie-breaking in sort for overlapping ranges.
+    // Sort by start offset, then by !is_open (open before close),
+    // then by a length-based criterion (longer openers first, shorter closers first).
+    sort_key: (usize, bool, isize),
 }
 
-impl From<Range<usize>> for RangeKey {
-    fn from(range: Range<usize>) -> Self {
-        Self {
-            start: range.start,
-            end: range.end,
-        }
+impl Ord for BracketOccurrence {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sort_key.cmp(&other.sort_key)
     }
 }
 
-impl PartialEq for RangeKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.start == other.start && self.end == other.end
-    }
-}
-
-impl Eq for RangeKey {}
-
-impl Hash for RangeKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.start.hash(state);
-        self.end.hash(state);
-    }
-}
-
-impl PartialOrd for RangeKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+impl PartialOrd for BracketOccurrence {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for RangeKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match self.start.cmp(&other.start) {
-            Ordering::Equal => self.end.cmp(&other.end),
-            other => other,
-        }
-    }
-}
-
-/// Represents a bracket node in the AST
-#[derive(Debug, Clone)]
-struct BracketNode {
-    // Length of the bracket in characters (usually 1 for `{` or 2 for things like `/*`)
-    length: usize,
-    // Type of bracket (used to match opening and closing)
-    bracket_type: BracketType,
-    // Whether this is an opening or closing bracket
-    is_opening: bool,
-}
-
-/// Represents a bracket type to match opening and closing pairs
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum BracketType {
-    Brace,        // {}
-    Bracket,      // []
-    Parenthesis,  // ()
-    AngleBracket, // <>
-    Custom(u8),   // For any other bracket types
-}
-
-/// Represents a node in the bracket AST
-#[derive(Debug, Clone)]
-enum BracketAstNode {
-    /// A single bracket (opening or closing)
-    Bracket(BracketNode),
-
-    /// A pair of matched brackets with content between them
-    Pair {
-        opening: BracketNode,
-        content: Box<BracketAstNode>,
-        closing: BracketNode,
-        /// The total length of this pair (opening + content + closing)
-        length: usize,
-    },
-
-    /// A list of adjacent nodes (balanced using a (2,3)-tree approach)
-    List {
-        children: Vec<BracketAstNode>,
-        /// The total length of all children
-        length: usize,
-    },
-
-    /// Text content without brackets
-    Text { length: usize },
-}
-
-impl BracketAstNode {
-    /// Gets the total length of this node
-    fn length(&self) -> usize {
-        match self {
-            BracketAstNode::Bracket(bracket) => bracket.length,
-            BracketAstNode::Pair { length, .. } => *length,
-            BracketAstNode::List { length, .. } => *length,
-            BracketAstNode::Text { length } => *length,
-        }
-    }
-
-    /// Creates a new Text node
-    fn text(length: usize) -> Self {
-        BracketAstNode::Text { length }
-    }
-
-    /// Creates a new List node from children
-    fn list(children: Vec<BracketAstNode>) -> Self {
-        let length = children.iter().map(|child| child.length()).sum();
-        BracketAstNode::List { children, length }
-    }
-
-    /// Creates a balanced (2,3)-tree from nodes
-    fn create_balanced_list(nodes: Vec<BracketAstNode>) -> Self {
-        if nodes.is_empty() {
-            return BracketAstNode::text(0);
-        }
-
-        if nodes.len() <= 3 {
-            return BracketAstNode::list(nodes);
-        }
-
-        // Create a balanced tree by recursively splitting into groups of 2-3 children
-        let mut balanced_children = Vec::new();
-        let mut i = 0;
-
-        while i < nodes.len() {
-            let chunk_size = if nodes.len() - i >= 5 {
-                3
-            } else if nodes.len() - i >= 3 {
-                2
-            } else {
-                nodes.len() - i
-            };
-
-            let chunk = nodes[i..i + chunk_size].to_vec();
-            balanced_children.push(BracketAstNode::list(chunk));
-            i += chunk_size;
-        }
-
-        // Recursively balance if we still have too many children
-        if balanced_children.len() > 3 {
-            return Self::create_balanced_list(balanced_children);
-        } else {
-            return BracketAstNode::list(balanced_children);
-        }
-    }
-}
-
-/// Represents the full bracket pair coloring state
-#[derive(Clone)]
-struct BracketPairAst {
-    root: BracketAstNode,
-    // Cache the last query results to avoid recomputing when nothing changed
-    cache: HashMap<RangeKey, Vec<(Range<usize>, usize)>>,
-    // Last time the AST was built or updated
-    last_update: Instant,
-}
-
-impl BracketPairAst {
-    /// Build a new AST from the buffer content
-    fn build(content: &str) -> Self {
-        let mut parser = BracketParser::new(content);
-        let root = parser.parse_document();
-
-        Self {
-            root,
-            cache: HashMap::new(),
-            last_update: Instant::now(),
-        }
-    }
-
-    /// Find all bracket pairs in the given range and their nesting levels
-    fn find_bracket_pairs(&mut self, range: Range<usize>) -> Vec<(Range<usize>, usize)> {
-        // Check if we have a cached result for this range
-        let range_key = RangeKey::from(range.clone());
-        if let Some(cached) = self.cache.get(&range_key) {
-            return cached.clone();
-        }
-
-        let mut result = Vec::new();
-        let mut collector = BracketCollector::new(range.clone(), &mut result);
-        self.collect_brackets_in_range(&self.root, 0, &mut collector, 0);
-
-        // Cache the result for future queries
-        self.cache.insert(RangeKey::from(range), result.clone());
-
-        result
-    }
-
-    /// Collect all brackets in a range with their nesting levels
-    fn collect_brackets_in_range(
-        &self,
-        node: &BracketAstNode,
-        offset: usize,
-        collector: &mut BracketCollector,
-        nesting_level: usize,
-    ) -> usize {
-        let node_end = offset + node.length();
-
-        // Skip this node if it's entirely outside our target range
-        if node_end <= collector.range.start || offset >= collector.range.end {
-            return offset + node.length();
-        }
-
-        match node {
-            BracketAstNode::Bracket(bracket) => {
-                if offset >= collector.range.start && offset < collector.range.end {
-                    let bracket_range = offset..(offset + bracket.length);
-                    collector.add_bracket(bracket_range, nesting_level);
-                }
-                offset + bracket.length
-            }
-
-            BracketAstNode::Pair {
-                opening,
-                content,
-                closing,
-                ..
-            } => {
-                let mut current_offset = offset;
-
-                // Process opening bracket
-                if current_offset >= collector.range.start && current_offset < collector.range.end {
-                    let bracket_range = current_offset..(current_offset + opening.length);
-                    collector.add_bracket(bracket_range, nesting_level);
-                }
-                current_offset += opening.length;
-
-                // Process content (increasing nesting level)
-                current_offset = self.collect_brackets_in_range(
-                    content,
-                    current_offset,
-                    collector,
-                    nesting_level + 1,
-                );
-
-                // Process closing bracket
-                if current_offset >= collector.range.start && current_offset < collector.range.end {
-                    let bracket_range = current_offset..(current_offset + closing.length);
-                    collector.add_bracket(bracket_range, nesting_level);
-                }
-                current_offset += closing.length;
-
-                current_offset
-            }
-
-            BracketAstNode::List { children, .. } => {
-                let mut current_offset = offset;
-
-                for child in children {
-                    current_offset = self.collect_brackets_in_range(
-                        child,
-                        current_offset,
-                        collector,
-                        nesting_level,
-                    );
-                }
-
-                current_offset
-            }
-
-            BracketAstNode::Text { length } => offset + length,
-        }
-    }
-}
-
-/// Helper to collect brackets and their nesting levels
-struct BracketCollector<'a> {
-    range: Range<usize>,
-    results: &'a mut Vec<(Range<usize>, usize)>,
-}
-
-impl<'a> BracketCollector<'a> {
-    fn new(range: Range<usize>, results: &'a mut Vec<(Range<usize>, usize)>) -> Self {
-        Self { range, results }
-    }
-
-    fn add_bracket(&mut self, range: Range<usize>, nesting_level: usize) {
-        self.results.push((range, nesting_level));
-    }
-}
-
-/// Parser to build the bracket AST from text
-struct BracketParser<'a> {
-    content: &'a str,
-    pos: usize,
-}
-
-impl<'a> BracketParser<'a> {
-    fn new(content: &'a str) -> Self {
-        Self { content, pos: 0 }
-    }
-
-    /// Parse the entire document
-    fn parse_document(&mut self) -> BracketAstNode {
-        let mut nodes = Vec::new();
-
-        while self.pos < self.content.len() {
-            nodes.push(self.parse_node());
-        }
-
-        // Create a balanced (2,3)-tree from all nodes
-        BracketAstNode::create_balanced_list(nodes)
-    }
-
-    /// Parse a single node (text, bracket, or pair)
-    fn parse_node(&mut self) -> BracketAstNode {
-        if self.at_bracket() {
-            self.parse_bracket_or_pair()
-        } else {
-            self.parse_text()
-        }
-    }
-
-    /// Parse a text segment (no brackets)
-    fn parse_text(&mut self) -> BracketAstNode {
-        let start = self.pos;
-
-        while self.pos < self.content.len() && !self.at_bracket() {
-            self.pos += 1;
-        }
-
-        BracketAstNode::text(self.pos - start)
-    }
-
-    /// Parse a bracket or pair starting at the current position
-    fn parse_bracket_or_pair(&mut self) -> BracketAstNode {
-        let (bracket, is_opening) = self.parse_bracket();
-
-        if is_opening {
-            // This is an opening bracket, try to find the matching closing bracket
-            let opening = bracket;
-            let start_pos = self.pos;
-
-            // Parse content until we find the matching closing bracket
-            let mut content_nodes = Vec::new();
-            let mut nesting_level = 1;
-
-            while self.pos < self.content.len() && nesting_level > 0 {
-                if self.at_bracket() {
-                    let (bracket, is_opening) = self.peek_bracket();
-
-                    if is_opening {
-                        // Another opening bracket of the same type increases nesting
-                        if bracket.bracket_type == opening.bracket_type {
-                            nesting_level += 1;
-                        }
-                        content_nodes.push(self.parse_bracket_or_pair());
-                    } else {
-                        // A closing bracket of the same type decreases nesting
-                        if bracket.bracket_type == opening.bracket_type {
-                            nesting_level -= 1;
-
-                            // If this is the matching closing bracket, we're done
-                            if nesting_level == 0 {
-                                let (closing, _) = self.parse_bracket();
-                                let content = if content_nodes.is_empty() {
-                                    BracketAstNode::text(0)
-                                } else if content_nodes.len() == 1 {
-                                    content_nodes.remove(0)
-                                } else {
-                                    BracketAstNode::create_balanced_list(content_nodes)
-                                };
-
-                                let total_length =
-                                    opening.length + content.length() + closing.length;
-
-                                return BracketAstNode::Pair {
-                                    opening,
-                                    content: Box::new(content),
-                                    closing,
-                                    length: total_length,
-                                };
-                            }
-                        }
-
-                        content_nodes.push(self.parse_bracket_or_pair());
-                    }
-                } else {
-                    content_nodes.push(self.parse_text());
-                }
-            }
-
-            // If we couldn't find the closing bracket, treat this as an unpaired bracket
-            self.pos = start_pos;
-            BracketAstNode::Bracket(opening)
-        } else {
-            // This is a closing bracket without an opening one
-            BracketAstNode::Bracket(bracket)
-        }
-    }
-
-    /// Parse a single bracket at the current position
-    fn parse_bracket(&mut self) -> (BracketNode, bool) {
-        let result = self.peek_bracket();
-        self.pos += result.0.length;
-        result
-    }
-
-    /// Peek at the current character to see if it's a bracket
-    fn peek_bracket(&self) -> (BracketNode, bool) {
-        if self.pos >= self.content.len() {
-            return (
-                BracketNode {
-                    length: 0,
-                    bracket_type: BracketType::Custom(0),
-                    is_opening: false,
-                },
-                false,
-            );
-        }
-
-        let c = self.content.as_bytes()[self.pos];
-
-        match c {
-            b'{' => (
-                BracketNode {
-                    length: 1,
-                    bracket_type: BracketType::Brace,
-                    is_opening: true,
-                },
-                true,
-            ),
-            b'}' => (
-                BracketNode {
-                    length: 1,
-                    bracket_type: BracketType::Brace,
-                    is_opening: false,
-                },
-                false,
-            ),
-            b'[' => (
-                BracketNode {
-                    length: 1,
-                    bracket_type: BracketType::Bracket,
-                    is_opening: true,
-                },
-                true,
-            ),
-            b']' => (
-                BracketNode {
-                    length: 1,
-                    bracket_type: BracketType::Bracket,
-                    is_opening: false,
-                },
-                false,
-            ),
-            b'(' => (
-                BracketNode {
-                    length: 1,
-                    bracket_type: BracketType::Parenthesis,
-                    is_opening: true,
-                },
-                true,
-            ),
-            b')' => (
-                BracketNode {
-                    length: 1,
-                    bracket_type: BracketType::Parenthesis,
-                    is_opening: false,
-                },
-                false,
-            ),
-            b'<' => (
-                BracketNode {
-                    length: 1,
-                    bracket_type: BracketType::AngleBracket,
-                    is_opening: true,
-                },
-                true,
-            ),
-            b'>' => (
-                BracketNode {
-                    length: 1,
-                    bracket_type: BracketType::AngleBracket,
-                    is_opening: false,
-                },
-                false,
-            ),
-            _ => (
-                BracketNode {
-                    length: 0,
-                    bracket_type: BracketType::Custom(0),
-                    is_opening: false,
-                },
-                false,
-            ),
-        }
-    }
-
-    /// Check if we're at a bracket character
-    fn at_bracket(&self) -> bool {
-        if self.pos >= self.content.len() {
-            return false;
-        }
-
-        let c = self.content.as_bytes()[self.pos];
-        matches!(c, b'{' | b'}' | b'[' | b']' | b'(' | b')' | b'<' | b'>')
-    }
-}
-
-// Global cache for bracket pair ASTs - for this simple implementation,
-// we'll use a thread-local approach rather than a mutex
-thread_local! {
-    static BRACKET_AST_CACHE: std::cell::RefCell<HashMap<usize, (Instant, BracketPairAst)>> =
-        std::cell::RefCell::new(HashMap::new());
-}
-
-// Maximum time to keep an AST in the cache before rebuilding
-const MAX_CACHE_AGE: Duration = Duration::from_secs(10);
-
-/// Colors brackets based on their nesting level.
+/// Identifies all bracket characters in the snapshot and assigns them a color index
+/// based on their nesting level.
 ///
-/// This method analyzes the buffer, parses all brackets and their nesting levels,
-/// and applies appropriate background highlights to colorize them. The colors
-/// are chosen from the user's settings.
-pub fn colorize_bracket_pairs(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
-    // Clear existing bracket pair highlights
-    editor.clear_background_highlights::<BracketPairColorization>(cx);
+/// Returns a vector of (Range<usize>, usize) where Range is the byte offset of the bracket
+/// character and usize is the color index.
+pub fn colorize_bracket_pairs(snapshot: &BufferSnapshot) -> Vec<(Range<usize>, usize)> {
+    let mut colored_brackets = Vec::new();
+    let mut open_bracket_stack: VecDeque<OpenBracketInfo> = VecDeque::new();
 
-    // Check if the feature is enabled in settings and get bracket colors
-    // let (enabled, bracket_colors) = {
-    //     let settings = EditorSettings::get_global(cx);
-    //     (settings.bracket_pair_colorization.enabled,
-    //     settings.bracket_pair_colorization.colors)
-    // };
-    //
-
-    do_a_call();
-    println!(
-        "called from bracket pairs {}",
-        ARRAY_2.lock().unwrap().len()
-    );
-    let enabled = true;
-
-    let bracket_colors = vec![
-        "#e91e63".to_string(), // Pink
-        "#2196f3".to_string(), // Blue
-        "#4caf50".to_string(), // Green
-        "#ff9800".to_string(), // Orange
-        "#9c27b0".to_string(), // Purple
-        "#00bcd4".to_string(), // Cyan
-    ];
-
-    if !enabled {
-        return;
-    }
-    if bracket_colors.is_empty() {
-        return;
-    }
-
-    println!("we are here");
-
-    // Get the current editor state
-    let snapshot = editor.snapshot(window, cx);
-    let buffer_text = snapshot.buffer_snapshot.text();
-
-    // Get visible range to limit the brackets we highlight
-    let visible_range = {
-        // Since we can't easily convert viewport coordinates to buffer positions
-        // in a generic way, we'll process the entire buffer for now
-        // A more optimized implementation would only process visible text
-        let start_offset = 0;
-        let end_offset = buffer_text.len();
-
-        start_offset..end_offset
+    let Some(language) = snapshot.language() else {
+        return colored_brackets;
     };
 
-    // Create a unique identifier for this buffer state
-    let buffer_id = buffer_text.len(); // Use text length as the cache key
-
-    let mut ast = BRACKET_AST_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-
-        if let Some((last_update, cached_ast)) = cache.get_mut(&buffer_id) {
-            // If the cache is too old, rebuild
-            if last_update.elapsed() > MAX_CACHE_AGE {
-                let new_ast = BracketPairAst::build(&buffer_text);
-                *last_update = Instant::now();
-                *cached_ast = new_ast.clone();
-                new_ast
-            } else {
-                cached_ast.cache.clear(); // Clear query cache when reusing
-                cached_ast.clone()
-            }
-        } else {
-            // Build a new AST for this buffer
-            let ast = BracketPairAst::build(&buffer_text);
-            cache.insert(buffer_id, (Instant::now(), ast.clone()));
-            ast
-        }
-    });
-
-    // Find all bracket pairs in the visible range
-    let bracket_pairs = ast.find_bracket_pairs(visible_range);
-
-    // Convert offsets to anchors and apply highlights
-    let highlight_ranges: Vec<_> = bracket_pairs
-        .into_iter()
-        .map(|(range, nesting_level)| {
-            // Choose color based on nesting level
-            let color_index = nesting_level % bracket_colors.len();
-
-            // Convert the range offsets to a range that can be converted to anchors
-            let range = range.start..range.end;
-            let anchor_range = range.to_anchors(&snapshot.buffer_snapshot);
-
-            (anchor_range, color_index)
-        })
+    let scope = language.default_scope();
+    let bracket_pairs: Vec<&BracketPair> = scope
+        .brackets()
+        .filter_map(|(pair, enabled)| if enabled { Some(pair) } else { None })
         .collect();
 
-    // Group by color for more efficient highlight application
-    let mut by_color: HashMap<usize, Vec<Range<MultiBufferAnchor>>> = HashMap::new();
-    for (range, color_index) in highlight_ranges {
-        by_color.entry(color_index).or_default().push(range);
+    if bracket_pairs.is_empty() {
+        return colored_brackets;
     }
 
-    // Apply highlights for each color group
-    for (color_index, ranges) in by_color {
-        // Choose color function based on the nesting level
-        let color_fn = match color_index % 6 {
-            0 => bracket_color_red,
-            1 => bracket_color_green,
-            2 => bracket_color_blue,
-            3 => bracket_color_orange,
-            4 => bracket_color_purple,
-            _ => bracket_color_cyan,
-        };
+    let mut open_bracket_texts: Vec<&str> = Vec::new();
+    let mut close_bracket_texts: Vec<&str> = Vec::new();
+    let mut bracket_pair_map: HashMap<&str, &BracketPair> = HashMap::new();
 
-        println!("from highlight");
-        editor.highlight_background::<BracketPairColorization>(&ranges, color_fn, cx);
+    for pair in &bracket_pairs {
+        open_bracket_texts.push(&pair.start);
+        close_bracket_texts.push(&pair.end);
+        bracket_pair_map.insert(&pair.start, pair);
+        bracket_pair_map.insert(&pair.end, pair); // Map closing text to its pair too
     }
-}
 
-// Static color functions for bracket pair highlighting
-fn bracket_color_red(_theme: &ThemeColors) -> Hsla {
-    Hsla {
-        h: 0.0,
-        s: 0.7,
-        l: 0.6,
-        a: 0.3,
-    }
-}
+    let grammar = match language.grammar() {
+        Some(g) => g,
+        None => return colored_brackets,
+    };
+    let brackets_config = match grammar.brackets_config() {
+        Some(cfg) => cfg,
+        None => return colored_brackets,
+    };
+    let brackets_query = brackets_config.query();
 
-fn bracket_color_green(_theme: &ThemeColors) -> Hsla {
-    Hsla {
-        h: 0.33,
-        s: 0.7,
-        l: 0.6,
-        a: 0.3,
-    }
-}
+    let mut cursor = QueryCursor::new();
+    // Use the root node from the first syntax layer, if available.
+    let mut syntax_layers = snapshot.syntax_layers();
+    let root_node = match syntax_layers.next() {
+        Some(layer) => layer.node(),
+        None => return colored_brackets,
+    };
+    let rope = snapshot.text.as_rope();
+    let rope_string = rope.to_string();
+    let mut occurrences = Vec::new();
 
-fn bracket_color_blue(_theme: &ThemeColors) -> Hsla {
-    Hsla {
-        h: 0.66,
-        s: 0.7,
-        l: 0.6,
-        a: 0.3,
-    }
-}
+    let mut matches = cursor.matches(brackets_query, root_node, rope_string.as_bytes());
 
-fn bracket_color_orange(_theme: &ThemeColors) -> Hsla {
-    Hsla {
-        h: 0.16,
-        s: 0.7,
-        l: 0.6,
-        a: 0.3,
-    }
-}
+    while let Some(m) = matches.next() {
+        for capture in m.captures {
+            let node = capture.node;
+            let range = node.byte_range();
+            // text_for_range returns an iterator of chunks, so collect and concatenate
+            let text: String = snapshot.text_for_range(range.clone()).collect();
 
-fn bracket_color_purple(_theme: &ThemeColors) -> Hsla {
-    Hsla {
-        h: 0.83,
-        s: 0.7,
-        l: 0.6,
-        a: 0.3,
-    }
-}
+            let capture_name = &brackets_query.capture_names()[capture.index as usize];
+            let is_open = match capture_name.as_ref() {
+                "open" => true,
+                "close" => false,
+                // Other captures like "pair" or language-specific ones are ignored for basic colorization
+                _ => continue,
+            };
 
-fn bracket_color_cyan(_theme: &ThemeColors) -> Hsla {
-    Hsla {
-        h: 0.5,
-        s: 0.7,
-        l: 0.6,
-        a: 0.3,
+            // Ensure this bracket is part of the configured pairs for the language
+            if (is_open && open_bracket_texts.contains(&text.as_str()))
+                || (!is_open && close_bracket_texts.contains(&text.as_str()))
+            {
+                // For sorting: open brackets get negative length, close brackets get positive length.
+                // This helps in prioritizing: longer opening brackets first, shorter closing brackets first
+                // when start offsets are the same.
+                let sort_len_criteria = if is_open {
+                    -(text.len() as isize)
+                } else {
+                    text.len() as isize
+                };
+                occurrences.push(BracketOccurrence {
+                    range: range.clone(),
+                    text,
+                    is_open,
+                    sort_key: (range.start, !is_open, sort_len_criteria),
+                });
+            }
+        }
     }
+
+    occurrences.sort_unstable();
+
+    for occurrence in occurrences {
+        if occurrence.is_open {
+            let color_index = open_bracket_stack.len() % NUM_BRACKET_COLORS;
+            open_bracket_stack.push_back(OpenBracketInfo {
+                opener_text: occurrence.text.clone(),
+                color_index,
+            });
+            colored_brackets.push((occurrence.range, color_index));
+        } else {
+            // This is a closing bracket
+            if let Some(matching_open_info) = open_bracket_stack.back() {
+                // Check if the current closing bracket corresponds to the expected open bracket
+                // by looking up the configured pair for the *opener* on the stack.
+                if let Some(configured_pair_for_opener) =
+                    bracket_pair_map.get(matching_open_info.opener_text.as_str())
+                {
+                    if configured_pair_for_opener.end == occurrence.text {
+                        // Correctly matched pair
+                        let info = open_bracket_stack.pop_back().unwrap(); // Known to exist
+                        colored_brackets.push((occurrence.range, info.color_index));
+                    } else {
+                        // Mismatched closing bracket (e.g. `([)]`).
+                        // For now, we don't color mismatched closing brackets.
+                        // We also don't pop from the stack, as the open bracket is still expecting its match.
+                    }
+                }
+                // If configured_pair_for_opener is None, it's an internal logic error or misconfiguration.
+            } else {
+                // Unmatched closing bracket (e.g., `)]` at the start of a file).
+                // We don't color these.
+            }
+        }
+    }
+    colored_brackets
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{editor_tests::init_test, test::editor_lsp_test_context::EditorLspTestContext};
-    use indoc::indoc;
-
-    #[gpui::test]
-    async fn test_bracket_pair_colorization(cx: &mut gpui::TestAppContext) {
-        init_test(cx, |_| {});
-
-        let mut cx = EditorLspTestContext::new_rust(
-            lsp::ServerCapabilities {
-                document_formatting_provider: Some(lsp::OneOf::Left(true)),
-                ..Default::default()
-            },
-            cx,
-        )
-        .await;
-
-        // Test with nested brackets
-        cx.set_state(indoc! {r#"
-            fn test() {
-                let x = [(1, 2), {3, 4}];
-                if (x.len() > 0) {
-                    println!("Hello");
-                }
-            }
-        "#});
-
-        // Verify the code runs without errors
-        cx.update_editor(|editor, window, cx| {
-            colorize_bracket_pairs(editor, window, cx);
-        });
-    }
-
-    #[test]
-    fn test_bracket_parser() {
-        let content = "func() { [1, 2, (3 + 4)] }";
-        let mut parser = BracketParser::new(content);
-        let ast = parser.parse_document();
-
-        // Simple structure verification (not checking exact structure)
-        match ast {
-            BracketAstNode::List { .. } => {
-                // Success - we expect a list at the root
-                assert!(true);
-            }
-            _ => {
-                panic!("Expected a List node at the root");
-            }
-        }
-    }
+    // TODO: Add tests for colorize_bracket_pairs
+    // - Basic matching pairs: (), {}, []
+    // - Nested pairs
+    // - Multiple pairs on the same level
+    // - Mismatched pairs (e.g., ([)] )
+    // - Unclosed pairs (e.g., ( [ )
+    // - Unopened pairs (e.g., ) [ ] )
+    // - Correct color cycling
+    // - Empty input
+    // - Input with no brackets
+    // - Interaction with comments/strings (ensure brackets inside are ignored - this depends on tree-sitter query)
+    // - Languages with multi-character brackets (e.g. begin/end, if query supports them)
+    // - Test sort_key logic for overlapping/adjacent brackets (e.g. JSX <Foo attribute={<Bar />}>)
 }

@@ -76,6 +76,7 @@ telemetry.workspace = true
 text.workspace = true
 time.workspace = true
 theme.workspace = true
+tree-sitter.workspace = true
 tree-sitter-html = { workspace = true, optional = true }
 tree-sitter-rust = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }

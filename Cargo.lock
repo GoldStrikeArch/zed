@@ -4674,6 +4674,7 @@ dependencies = [
  "text",
  "theme",
  "time",
+ "tree-sitter",
  "tree-sitter-html",
  "tree-sitter-rust",
  "tree-sitter-typescript",

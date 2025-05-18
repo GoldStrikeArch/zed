@@ -1070,6 +1070,12 @@ pub struct Grammar {
     pub(crate) highlight_map: Mutex<HighlightMap>,
 }
 
+impl Grammar {
+    pub fn brackets_config(&self) -> Option<&BracketsConfig> {
+        self.brackets_config.as_ref()
+    }
+}
+
 struct IndentConfig {
     query: Query,
     indent_capture_ix: u32,
@@ -1179,11 +1185,17 @@ struct InjectionPatternConfig {
     combined: bool,
 }
 
-struct BracketsConfig {
-    query: Query,
-    open_capture_ix: u32,
-    close_capture_ix: u32,
-    patterns: Vec<BracketsPatternConfig>,
+pub struct BracketsConfig {
+    pub query: Query,
+    pub open_capture_ix: u32,
+    pub close_capture_ix: u32,
+    pub patterns: Vec<BracketsPatternConfig>,
+}
+
+impl BracketsConfig {
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
 }
 
 #[derive(Clone, Debug, Default)]

@@ -215,6 +215,14 @@ use workspace::{
 use crate::hover_links::{find_url, find_url_from_range};
 use crate::signature_help::{SignatureHelpHiddenBy, SignatureHelpState};
 
+use std::sync::{LazyLock, Mutex as MutexQwe};
+
+static ARRAY: LazyLock<MutexQwe<Vec<u8>>> = LazyLock::new(|| MutexQwe::new(vec![]));
+
+fn do_a_call() {
+    ARRAY.lock().unwrap().push(1);
+}
+
 pub const FILE_HEADER_HEIGHT: u32 = 2;
 pub const MULTI_BUFFER_EXCERPT_HEADER_HEIGHT: u32 = 1;
 pub const DEFAULT_MULTIBUFFER_CONTEXT: u32 = 2;
@@ -2723,6 +2731,8 @@ impl Editor {
                 self.available_code_actions.take();
             }
             println!("qweqweqweqwe");
+            do_a_call();
+            println!("called from editor {}", ARRAY.lock().unwrap().len());
             self.refresh_code_actions(window, cx);
             self.refresh_document_highlights(cx);
             self.refresh_selected_text_highlights(false, window, cx);
@@ -6123,6 +6133,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
+        println!("from refresh");
         let Some((query_text, query_range)) = self.prepare_highlight_query_from_selection(cx)
         else {
             self.clear_background_highlights::<SelectedTextHighlight>(cx);
@@ -18161,7 +18172,7 @@ impl Editor {
                 self.refresh_selected_text_highlights(true, window, cx);
                 // refresh_matching_bracket_highlights(self, window, cx);
                 println!("12312312321332312");
-                colorize_bracket_pairs(self, window, cx);
+                // colorize_bracket_pairs(self, window, cx);
                 if self.has_active_inline_completion() {
                     self.update_visible_inline_completion(window, cx);
                 }
@@ -18362,7 +18373,7 @@ impl Editor {
 
         println!("lalalala");
 
-        colorize_bracket_pairs(self, window, cx);
+        // colorize_bracket_pairs(self, window, cx);
 
         let old_cursor_shape = self.cursor_shape;
 

@@ -11,6 +11,14 @@ use std::{
 };
 use theme::ThemeColors;
 
+use std::sync::{LazyLock, Mutex as MutexQwe};
+
+static ARRAY_2: LazyLock<MutexQwe<Vec<u8>>> = LazyLock::new(|| MutexQwe::new(vec![]));
+
+fn do_a_call() {
+    ARRAY_2.lock().unwrap().push(1);
+}
+
 /// Module for colorizing matching bracket pairs with different colors.
 ///
 /// Implementation inspired by VS Code's bracket pair colorization, which
@@ -188,15 +196,6 @@ struct BracketPairAst {
 }
 
 impl BracketPairAst {
-    /// Create a new empty AST
-    fn new() -> Self {
-        Self {
-            root: BracketAstNode::text(0),
-            cache: HashMap::new(),
-            last_update: Instant::now(),
-        }
-    }
-
     /// Build a new AST from the buffer content
     fn build(content: &str) -> Self {
         let mut parser = BracketParser::new(content);
@@ -559,20 +558,37 @@ pub fn colorize_bracket_pairs(editor: &mut Editor, window: &mut Window, cx: &mut
     editor.clear_background_highlights::<BracketPairColorization>(cx);
 
     // Check if the feature is enabled in settings and get bracket colors
-    let (enabled, bracket_colors) = {
-        let settings = EditorSettings::get_global(cx);
-        (
-            settings.bracket_pair_colorization.enabled,
-            settings.bracket_pair_colorization.colors.clone(),
-        )
-    };
+    // let (enabled, bracket_colors) = {
+    //     let settings = EditorSettings::get_global(cx);
+    //     (settings.bracket_pair_colorization.enabled,
+    //     settings.bracket_pair_colorization.colors)
+    // };
+    //
+
+    do_a_call();
+    println!(
+        "called from bracket pairs {}",
+        ARRAY_2.lock().unwrap().len()
+    );
+    let enabled = true;
+
+    let bracket_colors = vec![
+        "#e91e63".to_string(), // Pink
+        "#2196f3".to_string(), // Blue
+        "#4caf50".to_string(), // Green
+        "#ff9800".to_string(), // Orange
+        "#9c27b0".to_string(), // Purple
+        "#00bcd4".to_string(), // Cyan
+    ];
+
     if !enabled {
         return;
     }
-    let bracket_colors = bracket_colors;
     if bracket_colors.is_empty() {
         return;
     }
+
+    println!("we are here");
 
     // Get the current editor state
     let snapshot = editor.snapshot(window, cx);
@@ -650,6 +666,7 @@ pub fn colorize_bracket_pairs(editor: &mut Editor, window: &mut Window, cx: &mut
             _ => bracket_color_cyan,
         };
 
+        println!("from highlight");
         editor.highlight_background::<BracketPairColorization>(&ranges, color_fn, cx);
     }
 }

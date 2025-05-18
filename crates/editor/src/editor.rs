@@ -948,6 +948,7 @@ pub struct Editor {
     gutter_highlights: TreeMap<TypeId, GutterHighlight>,
     scrollbar_marker_state: ScrollbarMarkerState,
     active_indent_guides_state: ActiveIndentGuidesState,
+    colored_bracket_ranges: Vec<(std::ops::Range<usize>, usize)>,
     nav_history: Option<ItemNavHistory>,
     context_menu: RefCell<Option<CodeContextMenu>>,
     context_menu_options: Option<ContextMenuOptions>,
@@ -1745,6 +1746,7 @@ impl Editor {
             buffer: buffer.clone(),
             display_map: display_map.clone(),
             selections,
+            colored_bracket_ranges: Vec::new(),
             scroll_manager: ScrollManager::new(cx),
             columnar_selection_tail: None,
             add_selections_state: None,
@@ -2737,7 +2739,9 @@ impl Editor {
             self.refresh_document_highlights(cx);
             self.refresh_selected_text_highlights(false, window, cx);
             // refresh_matching_bracket_highlights(self, window, cx);
-            colorize_bracket_pairs(self, window, cx);
+            // colorize_bracket_pairs(self, window, cx);
+            //
+            self.update_bracket_color_data(window, cx);
             self.update_visible_inline_completion(window, cx);
             self.edit_prediction_requires_modifier_in_indent_conflict = true;
             linked_editing_ranges::refresh_linked_ranges(self, window, cx);
@@ -18173,6 +18177,9 @@ impl Editor {
                 // refresh_matching_bracket_highlights(self, window, cx);
                 println!("12312312321332312");
                 // colorize_bracket_pairs(self, window, cx);
+                //
+                self.update_bracket_color_data(window, cx);
+                //
                 if self.has_active_inline_completion() {
                     self.update_visible_inline_completion(window, cx);
                 }
@@ -18374,6 +18381,8 @@ impl Editor {
         println!("lalalala");
 
         // colorize_bracket_pairs(self, window, cx);
+        //
+        self.update_bracket_color_data(window, cx);
 
         let old_cursor_shape = self.cursor_shape;
 
@@ -18428,6 +18437,19 @@ impl Editor {
 
     pub fn searchable(&self) -> bool {
         self.searchable
+    }
+
+    /// Updates the stored bracket colorization data based on the current buffer state.
+    fn update_bracket_color_data(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+
+        let new_bracket_data_usize =
+            bracket_pair_colorization::colorize_bracket_pairs_for_multibuffer(&buffer_snapshot);
+
+        if self.colored_bracket_ranges != new_bracket_data_usize {
+            self.colored_bracket_ranges = new_bracket_data_usize;
+            cx.notify();
+        }
     }
 
     fn open_proposed_changes_editor(

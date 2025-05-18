@@ -5,15 +5,7 @@ use std::{
 
 use language::{BracketPair, BufferSnapshot};
 
-use tree_sitter::{QueryCursor, StreamingIterator};
-
-use std::sync::{LazyLock, Mutex as MutexQwe};
-
-static ARRAY: LazyLock<MutexQwe<Vec<u8>>> = LazyLock::new(|| MutexQwe::new(vec![]));
-
-fn do_a_call() {
-    ARRAY.lock().unwrap().push(1);
-}
+use tree_sitter::{QueryCursor, StreamingIterator}; // Assuming this is zed_core::RopeExt
 
 // Number of distinct colors to cycle through for bracket pairs.
 pub const NUM_BRACKET_COLORS: usize = 6;
@@ -59,37 +51,17 @@ pub fn colorize_bracket_pairs(snapshot: &BufferSnapshot) -> Vec<(Range<usize>, u
     let mut colored_brackets = Vec::new();
     let mut open_bracket_stack: VecDeque<OpenBracketInfo> = VecDeque::new();
 
-    do_a_call();
-
-    println!(
-        "from colorize_bracket_pairs, call {}",
-        ARRAY.lock().unwrap().len(),
-    );
-
     let Some(language) = snapshot.language() else {
-        println!("[colorize_bracket_pairs] No language found in snapshot.");
         return colored_brackets;
     };
 
     let scope = language.default_scope();
     let bracket_pairs: Vec<&BracketPair> = scope
         .brackets()
-        .filter_map(|(pair, enabled)| {
-            if enabled && pair.start != "'" && pair.start != "\"" {
-                Some(pair)
-            } else {
-                None
-            }
-        })
+        .filter_map(|(pair, enabled)| if enabled { Some(pair) } else { None })
         .collect();
 
-    println!(
-        "[colorize_bracket_pairs] Found {} enabled bracket pairs.",
-        bracket_pairs.len()
-    );
-
     if bracket_pairs.is_empty() {
-        println!("[colorize_bracket_pairs] No enabled bracket pairs for language.");
         return colored_brackets;
     }
 
@@ -106,17 +78,11 @@ pub fn colorize_bracket_pairs(snapshot: &BufferSnapshot) -> Vec<(Range<usize>, u
 
     let grammar = match language.grammar() {
         Some(g) => g,
-        None => {
-            println!("[colorize_bracket_pairs] No grammar found for language.");
-            return colored_brackets;
-        }
+        None => return colored_brackets,
     };
     let brackets_config = match grammar.brackets_config() {
         Some(cfg) => cfg,
-        None => {
-            println!("[colorize_bracket_pairs] No brackets_config found for grammar.");
-            return colored_brackets;
-        }
+        None => return colored_brackets,
     };
     let brackets_query = brackets_config.query();
 
@@ -125,10 +91,7 @@ pub fn colorize_bracket_pairs(snapshot: &BufferSnapshot) -> Vec<(Range<usize>, u
     let mut syntax_layers = snapshot.syntax_layers();
     let root_node = match syntax_layers.next() {
         Some(layer) => layer.node(),
-        None => {
-            println!("[colorize_bracket_pairs] No syntax layers found in snapshot.");
-            return colored_brackets;
-        }
+        None => return colored_brackets,
     };
     let rope = snapshot.text.as_rope();
     let rope_string = rope.to_string();
@@ -136,9 +99,7 @@ pub fn colorize_bracket_pairs(snapshot: &BufferSnapshot) -> Vec<(Range<usize>, u
 
     let mut matches = cursor.matches(brackets_query, root_node, rope_string.as_bytes());
 
-    let mut match_count = 0;
     while let Some(m) = matches.next() {
-        match_count += 1;
         for capture in m.captures {
             let node = capture.node;
             let range = node.byte_range();
@@ -165,10 +126,6 @@ pub fn colorize_bracket_pairs(snapshot: &BufferSnapshot) -> Vec<(Range<usize>, u
                 } else {
                     text.len() as isize
                 };
-                println!(
-                    "[colorize_bracket_pairs] Found bracket: {:?}, range: {:?}, is_open: {}",
-                    text, range, is_open
-                );
                 occurrences.push(BracketOccurrence {
                     range: range.clone(),
                     text,
@@ -178,11 +135,6 @@ pub fn colorize_bracket_pairs(snapshot: &BufferSnapshot) -> Vec<(Range<usize>, u
             }
         }
     }
-    println!(
-        "[colorize_bracket_pairs] Total matches processed: {}, occurrences: {}",
-        match_count,
-        occurrences.len()
-    );
 
     occurrences.sort_unstable();
 
@@ -193,10 +145,6 @@ pub fn colorize_bracket_pairs(snapshot: &BufferSnapshot) -> Vec<(Range<usize>, u
                 opener_text: occurrence.text.clone(),
                 color_index,
             });
-            println!(
-                "[colorize_bracket_pairs] Pushed open bracket: {:?}, color_index: {}",
-                occurrence.text, color_index
-            );
             colored_brackets.push((occurrence.range, color_index));
         } else {
             // This is a closing bracket
@@ -209,16 +157,8 @@ pub fn colorize_bracket_pairs(snapshot: &BufferSnapshot) -> Vec<(Range<usize>, u
                     if configured_pair_for_opener.end == occurrence.text {
                         // Correctly matched pair
                         let info = open_bracket_stack.pop_back().unwrap(); // Known to exist
-                        println!(
-                            "[colorize_bracket_pairs] Matched close bracket: {:?}, color_index: {}",
-                            occurrence.text, info.color_index
-                        );
                         colored_brackets.push((occurrence.range, info.color_index));
                     } else {
-                        println!(
-                            "[colorize_bracket_pairs] Mismatched close bracket: {:?}, expected: {:?}",
-                            occurrence.text, configured_pair_for_opener.end
-                        );
                         // Mismatched closing bracket (e.g. `([)]`).
                         // For now, we don't color mismatched closing brackets.
                         // We also don't pop from the stack, as the open bracket is still expecting its match.
@@ -226,19 +166,11 @@ pub fn colorize_bracket_pairs(snapshot: &BufferSnapshot) -> Vec<(Range<usize>, u
                 }
                 // If configured_pair_for_opener is None, it's an internal logic error or misconfiguration.
             } else {
-                println!(
-                    "[colorize_bracket_pairs] Unmatched closing bracket: {:?}",
-                    occurrence.text
-                );
                 // Unmatched closing bracket (e.g., `)]` at the start of a file).
                 // We don't color these.
             }
         }
     }
-    println!(
-        "[colorize_bracket_pairs] Returning {} colored brackets.",
-        colored_brackets.len()
-    );
     colored_brackets
 }
 
@@ -246,20 +178,9 @@ pub fn colorize_bracket_pairs_for_multibuffer(
     snapshot: &multi_buffer::MultiBufferSnapshot,
 ) -> Vec<(Range<usize>, usize)> {
     if let Some((_, _, buffer_snapshot)) = snapshot.as_singleton() {
-        println!(
-            "[colorize_bracket_pairs_for_multibuffer] Singleton buffer detected, calling colorize_bracket_pairs."
-        );
-        let result = colorize_bracket_pairs(buffer_snapshot);
-        println!(
-            "[colorize_bracket_pairs_for_multibuffer] Result: {} colored brackets.",
-            result.len()
-        );
-        return result;
+        return colorize_bracket_pairs(buffer_snapshot);
     }
 
-    println!(
-        "[colorize_bracket_pairs_for_multibuffer] Non-singleton buffer, bracket colorization not supported."
-    );
     // For non-singleton buffers, we can't currently colorize brackets
     Vec::new()
 }

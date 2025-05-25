@@ -98,7 +98,7 @@ use gpui::{
     UTF16Selection, UnderlineStyle, UniformListScrollHandle, WeakEntity, WeakFocusHandle, Window,
     div, impl_actions, point, prelude::*, pulsating_between, px, relative, size,
 };
-// use highlight_matching_bracket::refresh_matching_bracket_highlights;
+use highlight_matching_bracket::refresh_matching_bracket_highlights;
 use hover_links::{HoverLink, HoveredLinkState, InlayHighlight, find_file};
 pub use hover_popover::hover_markdown_style;
 use hover_popover::{HoverState, hide_hover};
@@ -2738,7 +2738,7 @@ impl Editor {
             self.refresh_code_actions(window, cx);
             self.refresh_document_highlights(cx);
             self.refresh_selected_text_highlights(false, window, cx);
-            // refresh_matching_bracket_highlights(self, window, cx);
+            refresh_matching_bracket_highlights(self, window, cx);
             colorize_bracket_pairs(self, window, cx);
             self.update_visible_inline_completion(window, cx);
             self.edit_prediction_requires_modifier_in_indent_conflict = true;
@@ -18229,9 +18229,9 @@ impl Editor {
                 self.refresh_active_diagnostics(cx);
                 self.refresh_code_actions(window, cx);
                 self.refresh_selected_text_highlights(true, window, cx);
-                // refresh_matching_bracket_highlights(self, window, cx);
+                refresh_matching_bracket_highlights(self, window, cx);
                 println!("12312312321332312");
-                // colorize_bracket_pairs(self, window, cx);
+                colorize_bracket_pairs(self, window, cx);
                 if self.has_active_inline_completion() {
                     self.update_visible_inline_completion(window, cx);
                 }

@@ -21,6 +21,11 @@ pub fn refresh_matching_bracket_highlights(
 
     let snapshot = editor.snapshot(window, cx);
     let head = newest_selection.head();
+    if head > snapshot.buffer_snapshot.len() {
+        log::error!("bug: cursor offset is out of range while refreshing bracket highlights");
+        return;
+    }
+
     let mut tail = head;
     if (editor.cursor_shape == CursorShape::Block || editor.cursor_shape == CursorShape::Hollow)
         && head < snapshot.buffer_snapshot.len()
@@ -37,7 +42,7 @@ pub fn refresh_matching_bracket_highlights(
                 opening_range.to_anchors(&snapshot.buffer_snapshot),
                 closing_range.to_anchors(&snapshot.buffer_snapshot),
             ],
-            |theme| theme.editor_document_highlight_bracket_background,
+            |theme| theme.colors().editor_document_highlight_bracket_background,
             cx,
         )
     }

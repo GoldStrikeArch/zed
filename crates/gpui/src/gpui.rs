@@ -81,6 +81,7 @@ mod executor;
 mod geometry;
 mod global;
 mod input;
+mod inspector;
 mod interactive;
 mod key_dispatch;
 mod keymap;
@@ -135,6 +136,7 @@ pub use global::*;
 pub use gpui_macros::{AppContext, IntoElement, Render, VisualContext, register_action, test};
 pub use http_client;
 pub use input::*;
+pub use inspector::*;
 pub use interactive::*;
 use key_dispatch::*;
 pub use keymap::*;
@@ -253,7 +255,7 @@ pub trait VisualContext: AppContext {
         update: impl FnOnce(&mut T, &mut Window, &mut Context<T>) -> R,
     ) -> Self::Result<R>;
 
-    /// Update a view with the given callback
+    /// Create a new entity, with access to `Window`.
     fn new_window_entity<T: 'static>(
         &mut self,
         build_entity: impl FnOnce(&mut Window, &mut Context<T>) -> T,

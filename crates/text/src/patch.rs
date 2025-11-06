@@ -9,15 +9,7 @@ pub struct Patch<T>(Vec<Edit<T>>);
 
 impl<T> Patch<T>
 where
-    T: 'static
-        + Clone
-        + Copy
-        + Ord
-        + Sub<T, Output = T>
-        + Add<T, Output = T>
-        + AddAssign
-        + Default
-        + PartialEq,
+    T: 'static + Clone + Copy + Ord + Default,
 {
     pub fn new(edits: Vec<Edit<T>>) -> Self {
         #[cfg(debug_assertions)]
@@ -41,7 +33,50 @@ where
     pub fn into_inner(self) -> Vec<Edit<T>> {
         self.0
     }
+    pub fn invert(&mut self) -> &mut Self {
+        for edit in &mut self.0 {
+            mem::swap(&mut edit.old, &mut edit.new);
+        }
+        self
+    }
 
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn push(&mut self, edit: Edit<T>) {
+        if edit.is_empty() {
+            return;
+        }
+
+        if let Some(last) = self.0.last_mut() {
+            if last.old.end >= edit.old.start {
+                last.old.end = edit.old.end;
+                last.new.end = edit.new.end;
+            } else {
+                self.0.push(edit);
+            }
+        } else {
+            self.0.push(edit);
+        }
+    }
+}
+
+impl<T, TDelta> Patch<T>
+where
+    T: 'static
+        + Copy
+        + Ord
+        + Sub<T, Output = TDelta>
+        + Add<TDelta, Output = T>
+        + AddAssign<TDelta>
+        + Default,
+    TDelta: Ord + Copy,
+{
     #[must_use]
     pub fn compose(&self, new_edits_iter: impl IntoIterator<Item = Edit<T>>) -> Self {
         let mut old_edits_iter = self.0.iter().cloned().peekable();
@@ -167,38 +202,6 @@ where
         }
 
         composed
-    }
-
-    pub fn invert(&mut self) -> &mut Self {
-        for edit in &mut self.0 {
-            mem::swap(&mut edit.old, &mut edit.new);
-        }
-        self
-    }
-
-    pub fn clear(&mut self) {
-        self.0.clear();
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn push(&mut self, edit: Edit<T>) {
-        if edit.is_empty() {
-            return;
-        }
-
-        if let Some(last) = self.0.last_mut() {
-            if last.old.end >= edit.old.start {
-                last.old.end = edit.old.end;
-                last.new.end = edit.new.end;
-            } else {
-                self.0.push(edit);
-            }
-        } else {
-            self.0.push(edit);
-        }
     }
 
     pub fn old_to_new(&self, old: T) -> T {
@@ -497,8 +500,8 @@ mod tests {
             .map(|i| i.parse().expect("invalid `OPERATIONS` variable"))
             .unwrap_or(20);
 
-        let initial_chars = (0..rng.gen_range(0..=100))
-            .map(|_| rng.gen_range(b'a'..=b'z') as char)
+        let initial_chars = (0..rng.random_range(0..=100))
+            .map(|_| rng.random_range(b'a'..=b'z') as char)
             .collect::<Vec<_>>();
         log::info!("initial chars: {:?}", initial_chars);
 
@@ -517,11 +520,11 @@ mod tests {
                     break;
                 }
 
-                let end = rng.gen_range(last_edit_end..=expected_chars.len());
-                let start = rng.gen_range(last_edit_end..=end);
+                let end = rng.random_range(last_edit_end..=expected_chars.len());
+                let start = rng.random_range(last_edit_end..=end);
                 let old_len = end - start;
 
-                let mut new_len = rng.gen_range(0..=3);
+                let mut new_len = rng.random_range(0..=3);
                 if start == end && new_len == 0 {
                     new_len += 1;
                 }
@@ -529,7 +532,7 @@ mod tests {
                 last_edit_end = start + new_len + 1;
 
                 let new_chars = (0..new_len)
-                    .map(|_| rng.gen_range(b'A'..=b'Z') as char)
+                    .map(|_| rng.random_range(b'A'..=b'Z') as char)
                     .collect::<Vec<_>>();
                 log::info!(
                     "  editing {:?}: {:?}",

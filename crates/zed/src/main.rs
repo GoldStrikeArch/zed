@@ -2,7 +2,7 @@ mod reliability;
 mod zed;
 
 use agent_ui::AgentPanel;
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Error, Result};
 use clap::{Parser, command};
 use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
 use client::{Client, ProxySettings, UserStore, parse_zed_link};
@@ -12,24 +12,23 @@ use crashes::InitCrashHandler;
 use db::kvp::{GLOBAL_KEY_VALUE_STORE, KEY_VALUE_STORE};
 use editor::Editor;
 use extension::ExtensionHostProxy;
-use extension_host::ExtensionStore;
 use fs::{Fs, RealFs};
 use futures::{StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
 use gpui::{App, AppContext, Application, AsyncApp, Focusable as _, UpdateGlobal as _};
 
 use gpui_tokio::Tokio;
-use http_client::{Url, read_proxy_from_env};
 use language::LanguageRegistry;
 use onboarding::{FIRST_OPEN, show_onboarding_view};
 use prompt_store::PromptBuilder;
+use remote::RemoteConnectionOptions;
 use reqwest_client::ReqwestClient;
 
 use assets::Assets;
 use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use parking_lot::Mutex;
 use project::project_settings::ProjectSettings;
-use recent_projects::{SshSettings, open_ssh_project};
+use recent_projects::{SshSettings, open_remote_project};
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use session::{AppSession, Session};
 use settings::{BaseKeymap, Settings, SettingsStore, watch_config_file};
@@ -40,15 +39,12 @@ use std::{
     process,
     sync::Arc,
 };
-use theme::{
-    ActiveTheme, IconThemeNotFoundError, SystemAppearance, ThemeNotFoundError, ThemeRegistry,
-    ThemeSettings,
-};
+use theme::{ActiveTheme, GlobalTheme, ThemeRegistry};
 use util::{ResultExt, TryFutureExt, maybe};
 use uuid::Uuid;
 use workspace::{
-    AppState, SerializedWorkspaceLocation, Toast, Workspace, WorkspaceSettings, WorkspaceStore,
-    notifications::NotificationId,
+    AppState, PathList, SerializedWorkspaceLocation, Toast, Workspace, WorkspaceSettings,
+    WorkspaceStore, notifications::NotificationId,
 };
 use zed::{
     OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
@@ -57,7 +53,7 @@ use zed::{
     initialize_workspace, open_paths_with_positions,
 };
 
-use crate::zed::OpenRequestKind;
+use crate::zed::{OpenRequestKind, eager_load_active_theme_and_icon_theme};
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -170,15 +166,16 @@ pub fn main() {
 
     let args = Args::parse();
 
-    // `zed --crash-handler` Makes zed operate in minidump crash handler mode
-    if let Some(socket) = &args.crash_handler {
-        crashes::crash_server(socket.as_path());
+    // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
+    #[cfg(not(target_os = "windows"))]
+    if let Some(socket) = &args.askpass {
+        askpass::main(socket);
         return;
     }
 
-    // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
-    if let Some(socket) = &args.askpass {
-        askpass::main(socket);
+    // `zed --crash-handler` Makes zed operate in minidump crash handler mode
+    if let Some(socket) = &args.crash_handler {
+        crashes::crash_server(socket.as_path());
         return;
     }
 
@@ -190,6 +187,15 @@ pub fn main() {
                 eprintln!("Error: {}", err);
                 process::exit(1);
             }
+        }
+    }
+
+    #[cfg(all(not(debug_assertions), target_os = "windows"))]
+    unsafe {
+        use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+
+        if args.foreground {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         }
     }
 
@@ -209,12 +215,14 @@ pub fn main() {
         paths::set_custom_data_dir(dir);
     }
 
-    #[cfg(all(not(debug_assertions), target_os = "windows"))]
-    unsafe {
-        use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
-
-        if args.foreground {
-            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    #[cfg(target_os = "windows")]
+    match util::get_zed_cli_path() {
+        Ok(path) => askpass::set_askpass_program(path),
+        Err(err) => {
+            eprintln!("Error: {}", err);
+            if std::option_env!("ZED_BUNDLE").is_some() {
+                process::exit(1);
+            }
         }
     }
 
@@ -249,6 +257,13 @@ pub fn main() {
         return;
     }
 
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .stack_size(10 * 1024 * 1024)
+        .thread_name(|ix| format!("RayonWorker{}", ix))
+        .build_global()
+        .unwrap();
+
     log::info!(
         "========== starting zed version {}, sha {} ==========",
         app_version,
@@ -258,6 +273,9 @@ pub fn main() {
             .as_deref()
             .unwrap_or("unknown"),
     );
+
+    #[cfg(windows)]
+    check_for_conpty_dll();
 
     let app = Application::new().with_assets(Assets);
 
@@ -270,6 +288,7 @@ pub fn main() {
         .spawn(crashes::init(InitCrashHandler {
             session_id: session_id.clone(),
             zed_version: app_version.to_string(),
+            binary: "zed".to_string(),
             release_channel: release_channel::RELEASE_CHANNEL_NAME.clone(),
             commit_sha: app_commit_sha
                 .as_ref()
@@ -277,17 +296,10 @@ pub fn main() {
                 .unwrap_or_else(|| "no sha".to_owned()),
         }))
         .detach();
-    reliability::init_panic_hook(
-        app_version,
-        app_commit_sha.clone(),
-        system_id.as_ref().map(|id| id.to_string()),
-        installation_id.as_ref().map(|id| id.to_string()),
-        session_id.clone(),
-    );
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
-    let failed_single_instance_check = if *db::ZED_STATELESS
+    let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
         || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
     {
         false
@@ -346,7 +358,7 @@ pub fn main() {
         app.background_executor()
             .spawn(async {
                 #[cfg(unix)]
-                util::load_login_shell_environment().log_err();
+                util::load_login_shell_environment().await.log_err();
                 shell_env_loaded_tx.send(()).ok();
             })
             .detach()
@@ -360,6 +372,7 @@ pub fn main() {
             open_listener.open(RawOpenRequest {
                 urls,
                 diff_paths: Vec::new(),
+                ..Default::default()
             })
         }
     });
@@ -403,16 +416,7 @@ pub fn main() {
             std::env::consts::OS,
             std::env::consts::ARCH
         );
-        let proxy_str = ProxySettings::get_global(cx).proxy.to_owned();
-        let proxy_url = proxy_str
-            .as_ref()
-            .and_then(|input| {
-                input
-                    .parse::<Url>()
-                    .inspect_err(|e| log::error!("Error parsing proxy settings: {}", e))
-                    .ok()
-            })
-            .or_else(read_proxy_from_env);
+        let proxy_url = ProxySettings::get_global(cx).proxy_url();
         let http = {
             let _guard = Tokio::handle(cx).enter();
 
@@ -465,7 +469,7 @@ pub fn main() {
 
         debug_adapter_extension::init(extension_host_proxy.clone(), cx);
         language::init(cx);
-        languages::init(languages.clone(), node_runtime.clone(), cx);
+        languages::init(languages.clone(), fs.clone(), node_runtime.clone(), cx);
         let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
         let workspace_store = cx.new(|cx| WorkspaceStore::new(client.clone(), cx));
 
@@ -540,15 +544,20 @@ pub fn main() {
         reliability::init(
             client.http_client(),
             system_id.as_ref().map(|id| id.to_string()),
-            installation_id.clone().map(|id| id.to_string()),
-            session_id.clone(),
+            cx,
+        );
+        extension_host::init(
+            extension_host_proxy.clone(),
+            app_state.fs.clone(),
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
             cx,
         );
 
-        SystemAppearance::init(cx);
         theme::init(theme::LoadThemes::All(Box::new(Assets)), cx);
+        eager_load_active_theme_and_icon_theme(fs.clone(), cx);
         theme_extension::init(
-            extension_host_proxy.clone(),
+            extension_host_proxy,
             ThemeRegistry::global(cx),
             cx.background_executor().clone(),
         );
@@ -565,7 +574,8 @@ pub fn main() {
         language_model::init(app_state.client.clone(), cx);
         language_models::init(app_state.user_store.clone(), app_state.client.clone(), cx);
         agent_settings::init(cx);
-        agent_servers::init(cx);
+        acp_tools::init(cx);
+        zeta2_tools::init(cx);
         web_search::init(cx);
         web_search_providers::init(app_state.client.clone(), cx);
         snippet_provider::init(cx);
@@ -579,20 +589,11 @@ pub fn main() {
             false,
             cx,
         );
-        assistant_tools::init(app_state.client.http_client(), cx);
         repl::init(app_state.fs.clone(), cx);
-        extension_host::init(
-            extension_host_proxy,
-            app_state.fs.clone(),
-            app_state.client.clone(),
-            app_state.node_runtime.clone(),
-            cx,
-        );
         recent_projects::init(cx);
 
         load_embedded_fonts(cx);
 
-        app_state.languages.set_theme(cx.theme().clone());
         editor::init(cx);
         image_viewer::init(cx);
         repl::notebook::init(cx);
@@ -617,6 +618,7 @@ pub fn main() {
         terminal_view::init(cx);
         journal::init(app_state.clone(), cx);
         language_selector::init(cx);
+        line_ending_selector::init(cx);
         toolchain_selector::init(cx);
         theme_selector::init(cx);
         settings_profile_selector::init(cx);
@@ -625,19 +627,18 @@ pub fn main() {
         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         collab_ui::init(&app_state, cx);
         git_ui::init(cx);
-        jj_ui::init(cx);
         feedback::init(cx);
         markdown_preview::init(cx);
         svg_preview::init(cx);
         onboarding::init(cx);
         settings_ui::init(cx);
+        keymap_editor::init(cx);
         extensions_ui::init(cx);
         zeta::init(cx);
         inspector_ui::init(app_state.clone(), cx);
+        json_schema_store::init(cx);
 
         cx.observe_global::<SettingsStore>({
-            let fs = fs.clone();
-            let languages = app_state.languages.clone();
             let http = app_state.client.http_client();
             let client = app_state.client.clone();
             move |cx| {
@@ -650,9 +651,6 @@ pub fn main() {
                         .ok();
                 }
 
-                eager_load_active_theme_and_icon_theme(fs.clone(), cx);
-
-                languages.set_theme(cx.theme().clone());
                 let new_host = &client::ClientSettings::get_global(cx).server_url;
                 if &http.base_url() != new_host {
                     http.set_base_url(new_host);
@@ -660,6 +658,14 @@ pub fn main() {
                         client.reconnect(&cx.to_async());
                     }
                 }
+            }
+        })
+        .detach();
+        app_state.languages.set_theme(cx.theme().clone());
+        cx.observe_global::<GlobalTheme>({
+            let languages = app_state.languages.clone();
+            move |cx| {
+                languages.set_theme(cx.theme().clone());
             }
         })
         .detach();
@@ -680,7 +686,8 @@ pub fn main() {
         watch_themes(fs.clone(), cx);
         watch_languages(fs.clone(), app_state.languages.clone(), cx);
 
-        cx.set_menus(app_menus());
+        let menus = app_menus(cx);
+        cx.set_menus(menus);
         initialize_workspace(app_state.clone(), prompt_builder, cx);
 
         cx.activate(true);
@@ -694,7 +701,7 @@ pub fn main() {
         let urls: Vec<_> = args
             .paths_or_urls
             .iter()
-            .filter_map(|arg| parse_url_arg(arg, cx).log_err())
+            .map(|arg| parse_url_arg(arg, cx))
             .collect();
 
         let diff_paths: Vec<[String; 2]> = args
@@ -703,8 +710,17 @@ pub fn main() {
             .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
             .collect();
 
+        #[cfg(target_os = "windows")]
+        let wsl = args.wsl;
+        #[cfg(not(target_os = "windows"))]
+        let wsl = None;
+
         if !urls.is_empty() || !diff_paths.is_empty() {
-            open_listener.open(RawOpenRequest { urls, diff_paths })
+            open_listener.open(RawOpenRequest {
+                urls,
+                diff_paths,
+                wsl,
+            })
         }
 
         match open_rx
@@ -785,15 +801,83 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
             OpenRequestKind::DockMenuAction { index } => {
                 cx.perform_dock_menu_action(index);
             }
+            OpenRequestKind::BuiltinJsonSchema { schema_path } => {
+                workspace::with_active_or_new_workspace(cx, |_workspace, window, cx| {
+                    cx.spawn_in(window, async move |workspace, cx| {
+                        let res = async move {
+                            let json = app_state.languages.language_for_name("JSONC").await.ok();
+                            let json_schema_content =
+                                json_schema_store::resolve_schema_request_inner(
+                                    &app_state.languages,
+                                    &schema_path,
+                                    cx,
+                                )?;
+                            let json_schema_content =
+                                serde_json::to_string_pretty(&json_schema_content)
+                                    .context("Failed to serialize JSON Schema as JSON")?;
+                            let buffer_task = workspace.update(cx, |workspace, cx| {
+                                workspace
+                                    .project()
+                                    .update(cx, |project, cx| project.create_buffer(false, cx))
+                            })?;
+
+                            let buffer = buffer_task.await?;
+
+                            workspace.update_in(cx, |workspace, window, cx| {
+                                buffer.update(cx, |buffer, cx| {
+                                    buffer.set_language(json, cx);
+                                    buffer.edit([(0..0, json_schema_content)], None, cx);
+                                    buffer.edit(
+                                        [(0..0, format!("// {} JSON Schema\n", schema_path))],
+                                        None,
+                                        cx,
+                                    );
+                                });
+
+                                workspace.add_item_to_active_pane(
+                                    Box::new(cx.new(|cx| {
+                                        let mut editor =
+                                            editor::Editor::for_buffer(buffer, None, window, cx);
+                                        editor.set_read_only(true);
+                                        editor
+                                    })),
+                                    None,
+                                    true,
+                                    window,
+                                    cx,
+                                );
+                            })
+                        }
+                        .await;
+                        res.context("Failed to open builtin JSON Schema").log_err();
+                    })
+                    .detach();
+                });
+            }
+            OpenRequestKind::Setting { setting_path } => {
+                // zed://settings/languages/$(language)/tab_size  - DONT SUPPORT
+                // zed://settings/languages/Rust/tab_size  - SUPPORT
+                // languages.$(language).tab_size
+                // [ languages $(language) tab_size]
+                workspace::with_active_or_new_workspace(cx, |_workspace, window, cx| {
+                    match setting_path {
+                        None => window.dispatch_action(Box::new(zed_actions::OpenSettings), cx),
+                        Some(setting_path) => window.dispatch_action(
+                            Box::new(zed_actions::OpenSettingsAt { path: setting_path }),
+                            cx,
+                        ),
+                    }
+                });
+            }
         }
 
         return;
     }
 
-    if let Some(connection_options) = request.ssh_connection {
+    if let Some(connection_options) = request.remote_connection {
         cx.spawn(async move |cx| {
             let paths: Vec<PathBuf> = request.open_paths.into_iter().map(PathBuf::from).collect();
-            open_ssh_project(
+            open_remote_project(
                 connection_options,
                 paths,
                 app_state,
@@ -946,17 +1030,20 @@ async fn installation_id() -> Result<IdType> {
 
 async fn restore_or_create_workspace(app_state: Arc<AppState>, cx: &mut AsyncApp) -> Result<()> {
     if let Some(locations) = restorable_workspace_locations(cx, &app_state).await {
+        let use_system_window_tabs = cx
+            .update(|cx| WorkspaceSettings::get_global(cx).use_system_window_tabs)
+            .unwrap_or(false);
+        let mut results: Vec<Result<(), Error>> = Vec::new();
         let mut tasks = Vec::new();
 
-        for location in locations {
+        for (index, (location, paths)) in locations.into_iter().enumerate() {
             match location {
-                SerializedWorkspaceLocation::Local(location, _) => {
+                SerializedWorkspaceLocation::Local => {
                     let app_state = app_state.clone();
-                    let paths = location.paths().to_vec();
                     let task = cx.spawn(async move |cx| {
                         let open_task = cx.update(|cx| {
                             workspace::open_paths(
-                                &paths,
+                                &paths.paths(),
                                 app_state,
                                 workspace::OpenOptions::default(),
                                 cx,
@@ -964,33 +1051,33 @@ async fn restore_or_create_workspace(app_state: Arc<AppState>, cx: &mut AsyncApp
                         })?;
                         open_task.await.map(|_| ())
                     });
-                    tasks.push(task);
-                }
-                SerializedWorkspaceLocation::Ssh(ssh) => {
-                    let app_state = app_state.clone();
-                    let ssh_host = ssh.host.clone();
-                    let task = cx.spawn(async move |cx| {
-                        let connection_options = cx.update(|cx| {
-                            SshSettings::get_global(cx)
-                                .connection_options_for(ssh.host, ssh.port, ssh.user)
-                        });
 
-                        match connection_options {
-                            Ok(connection_options) => recent_projects::open_ssh_project(
-                                connection_options,
-                                ssh.paths.into_iter().map(PathBuf::from).collect(),
-                                app_state,
-                                workspace::OpenOptions::default(),
-                                cx,
-                            )
-                            .await
-                            .map_err(|e| anyhow::anyhow!(e)),
-                            Err(e) => Err(anyhow::anyhow!(
-                                "Failed to get SSH connection options for {}: {}",
-                                ssh_host,
-                                e
-                            )),
-                        }
+                    // If we're using system window tabs and this is the first workspace,
+                    // wait for it to finish so that the other windows can be added as tabs.
+                    if use_system_window_tabs && index == 0 {
+                        results.push(task.await);
+                    } else {
+                        tasks.push(task);
+                    }
+                }
+                SerializedWorkspaceLocation::Remote(mut connection_options) => {
+                    let app_state = app_state.clone();
+                    if let RemoteConnectionOptions::Ssh(options) = &mut connection_options {
+                        cx.update(|cx| {
+                            SshSettings::get_global(cx)
+                                .fill_connection_options_from_settings(options)
+                        })?;
+                    }
+                    let task = cx.spawn(async move |cx| {
+                        recent_projects::open_remote_project(
+                            connection_options,
+                            paths.paths().into_iter().map(PathBuf::from).collect(),
+                            app_state,
+                            workspace::OpenOptions::default(),
+                            cx,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))
                     });
                     tasks.push(task);
                 }
@@ -998,7 +1085,7 @@ async fn restore_or_create_workspace(app_state: Arc<AppState>, cx: &mut AsyncApp
         }
 
         // Wait for all workspaces to open concurrently
-        let results = future::join_all(tasks).await;
+        results.extend(future::join_all(tasks).await);
 
         // Show notifications for any errors that occurred
         let mut error_count = 0;
@@ -1069,7 +1156,7 @@ async fn restore_or_create_workspace(app_state: Arc<AppState>, cx: &mut AsyncApp
 pub(crate) async fn restorable_workspace_locations(
     cx: &mut AsyncApp,
     app_state: &Arc<AppState>,
-) -> Option<Vec<SerializedWorkspaceLocation>> {
+) -> Option<Vec<(SerializedWorkspaceLocation, PathList)>> {
     let mut restore_behavior = cx
         .update(|cx| WorkspaceSettings::get(None, cx).restore_on_startup)
         .ok()?;
@@ -1172,6 +1259,19 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     user_data_dir: Option<String>,
 
+    /// The username and WSL distribution to use when opening paths. If not specified,
+    /// Zed will attempt to open the paths directly.
+    ///
+    /// The username is optional, and if not specified, the default user for the distribution
+    /// will be used.
+    ///
+    /// Example: `me@Ubuntu` or `Ubuntu`.
+    ///
+    /// WARN: You should not fill in this field by hand.
+    #[cfg(target_os = "windows")]
+    #[arg(long, value_name = "USER@DISTRO")]
+    wsl: Option<String>,
+
     /// Instructs zed to run as a dev server on this machine. (not implemented)
     #[arg(long)]
     dev_server_token: Option<String>,
@@ -1180,11 +1280,6 @@ struct Args {
     /// that prevents Zed from starting, so you can't run `zed: copy system specs to clipboard`
     #[arg(long)]
     system_specs: bool,
-
-    /// Used for SSH/Git password authentication, to remove the need for netcat as a dependency,
-    /// by having Zed act like netcat communicating over a Unix socket.
-    #[arg(long, hide = true)]
-    askpass: Option<String>,
 
     /// Used for the MCP Server, to remove the need for netcat as a dependency,
     /// by having Zed act like netcat communicating over a Unix socket.
@@ -1208,6 +1303,13 @@ struct Args {
     #[arg(hide = true)]
     dock_action: Option<usize>,
 
+    /// Used for SSH/Git password authentication, to remove the need for netcat as a dependency,
+    /// by having Zed act like netcat communicating over a Unix socket.
+    #[arg(long)]
+    #[cfg(not(target_os = "windows"))]
+    #[arg(hide = true)]
+    askpass: Option<String>,
+
     #[arg(long, hide = true)]
     dump_all_actions: bool,
 
@@ -1230,18 +1332,18 @@ impl ToString for IdType {
     }
 }
 
-fn parse_url_arg(arg: &str, cx: &App) -> Result<String> {
+fn parse_url_arg(arg: &str, cx: &App) -> String {
     match std::fs::canonicalize(Path::new(&arg)) {
-        Ok(path) => Ok(format!("file://{}", path.display())),
-        Err(error) => {
+        Ok(path) => format!("file://{}", path.display()),
+        Err(_) => {
             if arg.starts_with("file://")
                 || arg.starts_with("zed-cli://")
                 || arg.starts_with("ssh://")
                 || parse_zed_link(arg, cx).is_some()
             {
-                Ok(arg.into())
+                arg.into()
             } else {
-                anyhow::bail!("error parsing path argument: {error}")
+                format!("file://{arg}")
             }
         }
     }
@@ -1271,63 +1373,6 @@ fn load_embedded_fonts(cx: &App) {
         .unwrap();
 }
 
-/// Eagerly loads the active theme and icon theme based on the selections in the
-/// theme settings.
-///
-/// This fast path exists to load these themes as soon as possible so the user
-/// doesn't see the default themes while waiting on extensions to load.
-fn eager_load_active_theme_and_icon_theme(fs: Arc<dyn Fs>, cx: &App) {
-    let extension_store = ExtensionStore::global(cx);
-    let theme_registry = ThemeRegistry::global(cx);
-    let theme_settings = ThemeSettings::get_global(cx);
-    let appearance = SystemAppearance::global(cx).0;
-
-    if let Some(theme_selection) = theme_settings.theme_selection.as_ref() {
-        let theme_name = theme_selection.theme(appearance);
-        if matches!(theme_registry.get(theme_name), Err(ThemeNotFoundError(_)))
-            && let Some(theme_path) = extension_store.read(cx).path_to_extension_theme(theme_name)
-        {
-            cx.spawn({
-                let theme_registry = theme_registry.clone();
-                let fs = fs.clone();
-                async move |cx| {
-                    theme_registry.load_user_theme(&theme_path, fs).await?;
-
-                    cx.update(|cx| {
-                        ThemeSettings::reload_current_theme(cx);
-                    })
-                }
-            })
-            .detach_and_log_err(cx);
-        }
-    }
-
-    if let Some(icon_theme_selection) = theme_settings.icon_theme_selection.as_ref() {
-        let icon_theme_name = icon_theme_selection.icon_theme(appearance);
-        if matches!(
-            theme_registry.get_icon_theme(icon_theme_name),
-            Err(IconThemeNotFoundError(_))
-        ) && let Some((icon_theme_path, icons_root_path)) = extension_store
-            .read(cx)
-            .path_to_extension_icon_theme(icon_theme_name)
-        {
-            cx.spawn({
-                let fs = fs.clone();
-                async move |cx| {
-                    theme_registry
-                        .load_icon_theme(&icon_theme_path, &icons_root_path, fs)
-                        .await?;
-
-                    cx.update(|cx| {
-                        ThemeSettings::reload_current_icon_theme(cx);
-                    })
-                }
-            })
-            .detach_and_log_err(cx);
-        }
-    }
-}
-
 /// Spawns a background task to load the user themes from the themes directory.
 fn load_user_themes_in_background(fs: Arc<dyn fs::Fs>, cx: &mut App) {
     cx.spawn({
@@ -1352,7 +1397,7 @@ fn load_user_themes_in_background(fs: Arc<dyn fs::Fs>, cx: &mut App) {
                     }
                 }
                 theme_registry.load_user_themes(themes_dir, fs).await?;
-                cx.update(ThemeSettings::reload_current_theme)?;
+                cx.update(GlobalTheme::reload_theme)?;
             }
             anyhow::Ok(())
         }
@@ -1378,7 +1423,7 @@ fn watch_themes(fs: Arc<dyn fs::Fs>, cx: &mut App) {
                         .await
                         .log_err()
                 {
-                    cx.update(ThemeSettings::reload_current_theme).log_err();
+                    cx.update(GlobalTheme::reload_theme).log_err();
                 }
             }
         }
@@ -1390,30 +1435,35 @@ fn watch_themes(fs: Arc<dyn fs::Fs>, cx: &mut App) {
 fn watch_languages(fs: Arc<dyn fs::Fs>, languages: Arc<LanguageRegistry>, cx: &mut App) {
     use std::time::Duration;
 
-    let path = {
-        let p = Path::new("crates/languages/src");
-        let Ok(full_path) = p.canonicalize() else {
+    cx.background_spawn(async move {
+        let languages_src = Path::new("crates/languages/src");
+        let Some(languages_src) = fs.canonicalize(languages_src).await.log_err() else {
             return;
         };
-        full_path
-    };
 
-    cx.spawn(async move |_| {
-        let (mut events, _) = fs.watch(path.as_path(), Duration::from_millis(100)).await;
+        let (mut events, watcher) = fs.watch(&languages_src, Duration::from_millis(100)).await;
+
+        // add subdirectories since fs.watch is not recursive on Linux
+        if let Some(mut paths) = fs.read_dir(&languages_src).await.log_err() {
+            while let Some(path) = paths.next().await {
+                if let Some(path) = path.log_err()
+                    && fs.is_dir(&path).await
+                {
+                    watcher.add(&path).log_err();
+                }
+            }
+        }
+
         while let Some(event) = events.next().await {
-            let has_language_file = event.iter().any(|event| {
-                event
-                    .path
-                    .extension()
-                    .map(|ext| ext.to_string_lossy().as_ref() == "scm")
-                    .unwrap_or(false)
-            });
+            let has_language_file = event
+                .iter()
+                .any(|event| event.path.extension().is_some_and(|ext| ext == "scm"));
             if has_language_file {
                 languages.reload();
             }
         }
     })
-    .detach()
+    .detach();
 }
 
 #[cfg(not(debug_assertions))]
@@ -1443,4 +1493,22 @@ fn dump_all_gpui_actions() {
         serde_json::to_string_pretty(&actions).unwrap().as_bytes(),
     )
     .unwrap();
+}
+
+#[cfg(target_os = "windows")]
+fn check_for_conpty_dll() {
+    use windows::{
+        Win32::{Foundation::FreeLibrary, System::LibraryLoader::LoadLibraryW},
+        core::w,
+    };
+
+    if let Ok(hmodule) = unsafe { LoadLibraryW(w!("conpty.dll")) } {
+        unsafe {
+            FreeLibrary(hmodule)
+                .context("Failed to free conpty.dll")
+                .log_err();
+        }
+    } else {
+        log::warn!("Failed to load conpty.dll. Terminal will work with reduced functionality.");
+    }
 }

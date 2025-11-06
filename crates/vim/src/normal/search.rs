@@ -1,9 +1,10 @@
-use editor::{Editor, EditorSettings};
+use editor::{Editor, EditorSettings, VimFlavor};
 use gpui::{Action, Context, Window, actions};
+
 use language::Point;
 use schemars::JsonSchema;
 use search::{BufferSearchBar, SearchOptions, buffer_search};
-use serde_derive::Deserialize;
+use serde::Deserialize;
 use settings::Settings;
 use std::{iter::Peekable, str::Chars};
 use util::serde::default_true;
@@ -195,6 +196,7 @@ impl Vim {
                         prior_selections,
                         prior_operator: self.operator_stack.last().cloned(),
                         prior_mode,
+                        is_helix_regex_search: false,
                     }
                 });
             }
@@ -203,7 +205,10 @@ impl Vim {
 
     // hook into the existing to clear out any vim search state on cmd+f or edit -> find.
     fn search_deploy(&mut self, _: &buffer_search::Deploy, _: &mut Window, cx: &mut Context<Self>) {
+        // Preserve the current mode when resetting search state
+        let current_mode = self.mode;
         self.search = Default::default();
+        self.search.prior_mode = current_mode;
         cx.propagate();
     }
 
@@ -215,11 +220,17 @@ impl Vim {
         let new_selections = self.editor_selections(window, cx);
         let result = pane.update(cx, |pane, cx| {
             let search_bar = pane.toolbar().read(cx).item_of_type::<BufferSearchBar>()?;
+            if self.search.is_helix_regex_search {
+                search_bar.update(cx, |search_bar, cx| {
+                    search_bar.select_all_matches(&Default::default(), window, cx)
+                });
+                return None;
+            }
             search_bar.update(cx, |search_bar, cx| {
                 let mut count = self.search.count;
                 let direction = self.search.direction;
                 search_bar.has_active_match();
-                let new_head = new_selections.last().unwrap().start;
+                let new_head = new_selections.last()?.start;
                 let is_different_head = self
                     .search
                     .prior_selections
@@ -230,7 +241,8 @@ impl Vim {
                     count = count.saturating_sub(1)
                 }
                 self.search.count = 1;
-                search_bar.select_match(direction, count, window, cx);
+                let collapse = !self.mode.is_helix();
+                search_bar.select_match(direction, count, collapse, window, cx);
                 search_bar.focus_editor(&Default::default(), window, cx);
 
                 let prior_selections: Vec<_> = self.search.prior_selections.drain(..).collect();
@@ -253,7 +265,7 @@ impl Vim {
         if prior_selections.iter().any(|s| {
             self.update_editor(cx, |_, editor, cx| {
                 !s.start
-                    .is_valid(&editor.snapshot(window, cx).buffer_snapshot)
+                    .is_valid(&editor.snapshot(window, cx).buffer_snapshot())
             })
             .unwrap_or(true)
         }) {
@@ -297,7 +309,8 @@ impl Vim {
                 if !search_bar.has_active_match() || !search_bar.show(window, cx) {
                     return false;
                 }
-                search_bar.select_match(direction, count, window, cx);
+                let collapse = !self.mode.is_helix();
+                search_bar.select_match(direction, count, collapse, window, cx);
                 true
             })
         });
@@ -306,6 +319,7 @@ impl Vim {
         }
 
         let new_selections = self.editor_selections(window, cx);
+
         self.search_motion(
             Motion::ZedSearchResult {
                 prior_selections,
@@ -357,12 +371,12 @@ impl Vim {
                     .query_suggestion(window, cx)
                     .or_else(|| cursor_word)
                 else {
-                    drop(search_bar.search("", None, window, cx));
+                    drop(search_bar.search("", None, false, window, cx));
                     return None;
                 };
 
                 let query = regex::escape(&query);
-                Some(search_bar.search(&query, Some(options), window, cx))
+                Some(search_bar.search(&query, Some(options), true, window, cx))
             });
 
             let Some(search) = search else { return false };
@@ -371,7 +385,8 @@ impl Vim {
             cx.spawn_in(window, async move |_, cx| {
                 search.await?;
                 search_bar.update_in(cx, |search_bar, window, cx| {
-                    search_bar.select_match(direction, count, window, cx);
+                    let collapse = editor::vim_flavor(cx) == Some(VimFlavor::Vim);
+                    search_bar.select_match(direction, count, collapse, window, cx);
 
                     vim.update(cx, |vim, cx| {
                         let new_selections = vim.editor_selections(window, cx);
@@ -422,7 +437,7 @@ impl Vim {
                         );
                     }
 
-                    Some(search_bar.search(&query, Some(options), window, cx))
+                    Some(search_bar.search(&query, Some(options), true, window, cx))
                 });
                 let Some(search) = search else { return };
                 let search_bar = search_bar.downgrade();
@@ -434,7 +449,7 @@ impl Vim {
                 cx.spawn_in(window, async move |_, cx| {
                     search.await?;
                     search_bar.update_in(cx, |search_bar, window, cx| {
-                        search_bar.select_match(direction, 1, window, cx)
+                        search_bar.select_match(direction, 1, true, window, cx)
                     })?;
                     anyhow::Ok(())
                 })
@@ -459,7 +474,8 @@ impl Vim {
         };
         if let Some(result) = self.update_editor(cx, |vim, editor, cx| {
             let range = action.range.buffer_range(vim, editor, window, cx)?;
-            let snapshot = &editor.snapshot(window, cx).buffer_snapshot;
+            let snapshot = editor.snapshot(window, cx);
+            let snapshot = snapshot.buffer_snapshot();
             let end_point = Point::new(range.end.0, snapshot.line_len(range.end));
             let range = snapshot.anchor_before(Point::new(range.start.0, 0))
                 ..snapshot.anchor_after(end_point);
@@ -506,7 +522,7 @@ impl Vim {
             if replacement.flag_c {
                 search_bar.focus_replace(window, cx);
             }
-            Some(search_bar.search(&search, Some(options), window, cx))
+            Some(search_bar.search(&search, Some(options), true, window, cx))
         });
         if replacement.flag_n {
             self.move_cursor(
@@ -531,7 +547,7 @@ impl Vim {
                 search_bar.select_last_match(window, cx);
                 search_bar.replace_all(&Default::default(), window, cx);
                 editor.update(cx, |editor, cx| editor.clear_search_within_ranges(cx));
-                let _ = search_bar.search(&search_bar.query(cx), None, window, cx);
+                let _ = search_bar.search(&search_bar.query(cx), None, false, window, cx);
                 vim.update(cx, |vim, cx| {
                     vim.move_cursor(
                         Motion::StartOfLine {
@@ -642,7 +658,6 @@ mod test {
         state::Mode,
         test::{NeovimBackedTestContext, VimTestContext},
     };
-    use editor::EditorSettings;
     use editor::{DisplayPoint, display_map::DisplayRow};
 
     use indoc::indoc;
@@ -691,7 +706,7 @@ mod test {
         let mut cx = VimTestContext::new(cx, true).await;
 
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<EditorSettings>(cx, |s| s.search_wrap = Some(false));
+            store.update_user_settings(cx, |s| s.editor.search_wrap = Some(false));
         });
 
         cx.set_state("ˇhi\nhigh\nhi\n", Mode::Normal);
@@ -812,7 +827,7 @@ mod test {
 
         // check that searching with unable search wrap
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<EditorSettings>(cx, |s| s.search_wrap = Some(false));
+            store.update_user_settings(cx, |s| s.editor.search_wrap = Some(false));
         });
         cx.set_state("aa\nbˇb\ncc\ncc\ncc\n", Mode::Normal);
         cx.simulate_keystrokes("/ c c enter");

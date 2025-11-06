@@ -1,5 +1,5 @@
 use super::{
-    BoolExt, MacKeyboardLayout,
+    BoolExt, MacKeyboardLayout, MacKeyboardMapper,
     attributed_string::{NSAttributedString, NSMutableAttributedString},
     events::key_to_native,
     renderer,
@@ -8,8 +8,9 @@ use crate::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardEntry, ClipboardItem, ClipboardString,
     CursorStyle, ForegroundExecutor, Image, ImageFormat, KeyContext, Keymap, MacDispatcher,
     MacDisplay, MacWindow, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformTextSystem, PlatformWindow, Result,
-    SemanticVersion, SystemMenuType, Task, WindowAppearance, WindowParams, hash,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformWindow, Result, SemanticVersion, SystemMenuType, Task, WindowAppearance, WindowParams,
+    hash,
 };
 use anyhow::{Context as _, anyhow};
 use block::ConcreteBlock;
@@ -81,6 +82,10 @@ unsafe fn build_classes() {
         APP_DELEGATE_CLASS = unsafe {
             let mut decl = ClassDecl::new("GPUIApplicationDelegate", class!(NSResponder)).unwrap();
             decl.add_ivar::<*mut c_void>(MAC_PLATFORM_IVAR);
+            decl.add_method(
+                sel!(applicationWillFinishLaunching:),
+                will_finish_launching as extern "C" fn(&mut Object, Sel, id),
+            );
             decl.add_method(
                 sel!(applicationDidFinishLaunching:),
                 did_finish_launching as extern "C" fn(&mut Object, Sel, id),
@@ -171,6 +176,7 @@ pub(crate) struct MacPlatformState {
     finish_launching: Option<Box<dyn FnOnce()>>,
     dock_menu: Option<id>,
     menus: Option<Vec<OwnedMenu>>,
+    keyboard_mapper: Rc<MacKeyboardMapper>,
 }
 
 impl Default for MacPlatform {
@@ -181,13 +187,16 @@ impl Default for MacPlatform {
 
 impl MacPlatform {
     pub(crate) fn new(headless: bool) -> Self {
-        let dispatcher = Arc::new(MacDispatcher::new());
+        let dispatcher = Arc::new(MacDispatcher);
 
         #[cfg(feature = "font-kit")]
         let text_system = Arc::new(crate::MacTextSystem::new());
 
         #[cfg(not(feature = "font-kit"))]
         let text_system = Arc::new(crate::NoopTextSystem::new());
+
+        let keyboard_layout = MacKeyboardLayout::new();
+        let keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
 
         Self(Mutex::new(MacPlatformState {
             headless,
@@ -209,6 +218,7 @@ impl MacPlatform {
             dock_menu: None,
             on_keyboard_layout_change: None,
             menus: None,
+            keyboard_mapper,
         }))
     }
 
@@ -348,19 +358,19 @@ impl MacPlatform {
                             let mut mask = NSEventModifierFlags::empty();
                             for (modifier, flag) in &[
                                 (
-                                    keystroke.modifiers.platform,
+                                    keystroke.modifiers().platform,
                                     NSEventModifierFlags::NSCommandKeyMask,
                                 ),
                                 (
-                                    keystroke.modifiers.control,
+                                    keystroke.modifiers().control,
                                     NSEventModifierFlags::NSControlKeyMask,
                                 ),
                                 (
-                                    keystroke.modifiers.alt,
+                                    keystroke.modifiers().alt,
                                     NSEventModifierFlags::NSAlternateKeyMask,
                                 ),
                                 (
-                                    keystroke.modifiers.shift,
+                                    keystroke.modifiers().shift,
                                     NSEventModifierFlags::NSShiftKeyMask,
                                 ),
                             ] {
@@ -373,7 +383,7 @@ impl MacPlatform {
                                 .initWithTitle_action_keyEquivalent_(
                                     ns_string(name),
                                     selector,
-                                    ns_string(key_to_native(&keystroke.key).as_ref()),
+                                    ns_string(key_to_native(keystroke.key()).as_ref()),
                                 )
                                 .autorelease();
                             if Self::os_version() >= SemanticVersion::new(12, 0, 0) {
@@ -533,6 +543,10 @@ impl Platform for MacPlatform {
             open "$1"
         "#;
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "We are restarting ourselves, using std command thus is fine"
+        )]
         let restart_process = Command::new("/bin/bash")
             .arg("-c")
             .arg(script)
@@ -845,11 +859,14 @@ impl Platform for MacPlatform {
             .lock()
             .background_executor
             .spawn(async move {
-                let _ = std::process::Command::new("open")
+                if let Some(mut child) = smol::process::Command::new("open")
                     .arg(path)
                     .spawn()
                     .context("invoking open command")
-                    .log_err();
+                    .log_err()
+                {
+                    child.status().await.log_err();
+                }
             })
             .detach();
     }
@@ -880,6 +897,10 @@ impl Platform for MacPlatform {
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
         Box::new(MacKeyboardLayout::new())
+    }
+
+    fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper> {
+        self.0.lock().keyboard_mapper.clone()
     }
 
     fn app_path(&self) -> Result<PathBuf> {
@@ -1103,7 +1124,32 @@ impl Platform for MacPlatform {
                 }
             }
 
-            // If it wasn't a string, try the various supported image types.
+            // Next, check for URL flavors (including file URLs). Some tools only provide a URL
+            // with no plain text entry.
+            {
+                // Try the modern UTType identifiers first.
+                let file_url_type: id = ns_string("public.file-url");
+                let url_type: id = ns_string("public.url");
+
+                let url_data = if msg_send![types, containsObject: file_url_type] {
+                    pasteboard.dataForType(file_url_type)
+                } else if msg_send![types, containsObject: url_type] {
+                    pasteboard.dataForType(url_type)
+                } else {
+                    nil
+                };
+
+                if url_data != nil && !url_data.bytes().is_null() {
+                    let bytes = slice::from_raw_parts(
+                        url_data.bytes() as *mut u8,
+                        url_data.length() as usize,
+                    );
+
+                    return Some(self.read_string_from_clipboard(&state, bytes));
+                }
+            }
+
+            // If it wasn't a string or URL, try the various supported image types.
             for format in ImageFormat::iter() {
                 if let Some(item) = try_clipboard_image(pasteboard, format) {
                     return Some(item);
@@ -1111,7 +1157,7 @@ impl Platform for MacPlatform {
             }
         }
 
-        // If it wasn't a string or a supported image type, give up.
+        // If it wasn't a string, URL, or a supported image type, give up.
         None
     }
 
@@ -1346,6 +1392,23 @@ unsafe fn get_mac_platform(object: &mut Object) -> &MacPlatform {
     }
 }
 
+extern "C" fn will_finish_launching(_this: &mut Object, _: Sel, _: id) {
+    unsafe {
+        let user_defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
+
+        // The autofill heuristic controller causes slowdown and high CPU usage.
+        // We don't know exactly why. This disables the full heuristic controller.
+        //
+        // Adapted from: https://github.com/ghostty-org/ghostty/pull/8625
+        let name = ns_string("NSAutoFillHeuristicControllerEnabled");
+        let existing_value: id = msg_send![user_defaults, objectForKey: name];
+        if existing_value == nil {
+            let false_value: id = msg_send![class!(NSNumber), numberWithBool:false];
+            let _: () = msg_send![user_defaults, setObject: false_value forKey: name];
+        }
+    }
+}
+
 extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
     unsafe {
         let app: id = msg_send![APP_CLASS, sharedApplication];
@@ -1393,6 +1456,8 @@ extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
 extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
     let platform = unsafe { get_mac_platform(this) };
     let mut lock = platform.0.lock();
+    let keyboard_layout = MacKeyboardLayout::new();
+    lock.keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
     if let Some(mut callback) = lock.on_keyboard_layout_change.take() {
         drop(lock);
         callback();
@@ -1567,6 +1632,7 @@ impl From<ImageFormat> for UTType {
             ImageFormat::Gif => Self::gif(),
             ImageFormat::Bmp => Self::bmp(),
             ImageFormat::Svg => Self::svg(),
+            ImageFormat::Ico => Self::ico(),
         }
     }
 }
@@ -1603,6 +1669,11 @@ impl UTType {
     pub fn svg() -> Self {
         // https://developer.apple.com/documentation/uniformtypeidentifiers/uttype-swift.struct/svg
         Self(unsafe { ns_string("public.svg-image") })
+    }
+
+    pub fn ico() -> Self {
+        // https://developer.apple.com/documentation/uniformtypeidentifiers/uttype-swift.struct/ico
+        Self(unsafe { ns_string("com.microsoft.ico") })
     }
 
     pub fn tiff() -> Self {
@@ -1658,6 +1729,40 @@ mod tests {
         assert_eq!(
             platform.read_from_clipboard(),
             Some(ClipboardItem::new_string(text_from_other_app.to_string()))
+        );
+    }
+
+    #[test]
+    fn test_file_url_reads_as_url_string() {
+        let platform = build_platform();
+
+        // Create a file URL for an arbitrary test path and write it to the pasteboard.
+        // This path does not need to exist; we only validate URL→path conversion.
+        let mock_path = "/tmp/zed-clipboard-file-url-test";
+        unsafe {
+            // Build an NSURL from the file path
+            let url: id = msg_send![class!(NSURL), fileURLWithPath: ns_string(mock_path)];
+            let abs: id = msg_send![url, absoluteString];
+
+            // Encode the URL string as UTF-8 bytes
+            let len: usize = msg_send![abs, lengthOfBytesUsingEncoding: NSUTF8StringEncoding];
+            let bytes_ptr = abs.UTF8String() as *const u8;
+            let data = NSData::dataWithBytes_length_(nil, bytes_ptr as *const c_void, len as u64);
+
+            // Write as public.file-url to the unique pasteboard
+            let file_url_type: id = ns_string("public.file-url");
+            platform
+                .0
+                .lock()
+                .pasteboard
+                .setData_forType(data, file_url_type);
+        }
+
+        // Ensure the clipboard read returns the URL string, not a converted path
+        let expected_url = format!("file://{}", mock_path);
+        assert_eq!(
+            platform.read_from_clipboard(),
+            Some(ClipboardItem::new_string(expected_url))
         );
     }
 

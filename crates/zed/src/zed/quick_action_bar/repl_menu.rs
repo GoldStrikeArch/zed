@@ -1,7 +1,5 @@
-use std::time::Duration;
-
 use gpui::ElementId;
-use gpui::{Animation, AnimationExt, AnyElement, Entity, Transformation, percentage};
+use gpui::{AnyElement, Entity};
 use picker::Picker;
 use repl::{
     ExecutionState, JupyterSettings, Kernel, KernelSpecification, KernelStatus, Session,
@@ -10,8 +8,8 @@ use repl::{
     worktree_id_for_editor,
 };
 use ui::{
-    ButtonLike, ContextMenu, IconWithIndicator, Indicator, IntoElement, PopoverMenu,
-    PopoverMenuHandle, Tooltip, prelude::*,
+    ButtonLike, CommonAnimationExt, ContextMenu, IconWithIndicator, Indicator, IntoElement,
+    PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*,
 };
 use util::ResultExt;
 
@@ -56,7 +54,8 @@ impl QuickActionBar {
                     .count()
                     .ne(&0)
                     .then(|| {
-                        let latest = this.selections.newest_display(cx);
+                        let snapshot = this.display_snapshot(cx);
+                        let latest = this.selections.newest_display(&snapshot);
                         !latest.is_empty()
                     })
                     .unwrap_or_default()
@@ -224,11 +223,7 @@ impl QuickActionBar {
             .child(if menu_state.icon_is_animating {
                 Icon::new(menu_state.icon)
                     .color(menu_state.icon_color)
-                    .with_animation(
-                        "arrow-circle",
-                        Animation::new(Duration::from_secs(5)).repeat(),
-                        |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
-                    )
+                    .with_rotate_animation(5)
                     .into_any_element()
             } else {
                 IconWithIndicator::new(

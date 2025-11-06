@@ -45,13 +45,11 @@ pub struct WindowsWindowState {
     pub pending_surrogate: Option<u16>,
     pub last_reported_modifiers: Option<Modifiers>,
     pub last_reported_capslock: Option<Capslock>,
-    pub system_key_handled: bool,
     pub hovered: bool,
 
     pub renderer: DirectXRenderer,
 
     pub click_state: ClickState,
-    pub system_settings: WindowsSystemSettings,
     pub current_cursor: Option<HCURSOR>,
     pub nc_button_pressed: Option<u32>,
 
@@ -63,9 +61,9 @@ pub struct WindowsWindowState {
 
 pub(crate) struct WindowsWindowInner {
     hwnd: HWND,
-    pub(super) this: Weak<Self>,
     drop_target_helper: IDropTargetHelper,
     pub(crate) state: RefCell<WindowsWindowState>,
+    pub(crate) system_settings: RefCell<WindowsSystemSettings>,
     pub(crate) handle: AnyWindowHandle,
     pub(crate) hide_title_bar: bool,
     pub(crate) is_movable: bool,
@@ -73,12 +71,13 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) windows_version: WindowsVersion,
     pub(crate) validation_number: usize,
     pub(crate) main_receiver: flume::Receiver<Runnable>,
-    pub(crate) main_thread_id_win32: u32,
+    pub(crate) platform_window_handle: HWND,
 }
 
 impl WindowsWindowState {
     fn new(
         hwnd: HWND,
+        directx_devices: &DirectXDevices,
         window_params: &CREATESTRUCTW,
         current_cursor: Option<HCURSOR>,
         display: WindowsDisplay,
@@ -104,17 +103,15 @@ impl WindowsWindowState {
         };
         let border_offset = WindowBorderOffset::default();
         let restore_from_minimized = None;
-        let renderer = DirectXRenderer::new(hwnd, disable_direct_composition)
+        let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
             .context("Creating DirectX renderer")?;
         let callbacks = Callbacks::default();
         let input_handler = None;
         let pending_surrogate = None;
         let last_reported_modifiers = None;
         let last_reported_capslock = None;
-        let system_key_handled = false;
         let hovered = false;
         let click_state = ClickState::new();
-        let system_settings = WindowsSystemSettings::new(display);
         let nc_button_pressed = None;
         let fullscreen = None;
         let initial_placement = None;
@@ -133,11 +130,9 @@ impl WindowsWindowState {
             pending_surrogate,
             last_reported_modifiers,
             last_reported_capslock,
-            system_key_handled,
             hovered,
             renderer,
             click_state,
-            system_settings,
             current_cursor,
             nc_button_pressed,
             display,
@@ -170,7 +165,9 @@ impl WindowsWindowState {
                 length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
                 ..Default::default()
             };
-            GetWindowPlacement(self.hwnd, &mut placement).log_err();
+            GetWindowPlacement(self.hwnd, &mut placement)
+                .context("failed to get window placement")
+                .log_err();
             placement
         };
         (
@@ -205,9 +202,10 @@ impl WindowsWindowState {
 }
 
 impl WindowsWindowInner {
-    fn new(context: &WindowCreateContext, hwnd: HWND, cs: &CREATESTRUCTW) -> Result<Rc<Self>> {
+    fn new(context: &mut WindowCreateContext, hwnd: HWND, cs: &CREATESTRUCTW) -> Result<Rc<Self>> {
         let state = RefCell::new(WindowsWindowState::new(
             hwnd,
+            &context.directx_devices,
             cs,
             context.current_cursor,
             context.display,
@@ -216,9 +214,8 @@ impl WindowsWindowInner {
             context.disable_direct_composition,
         )?);
 
-        Ok(Rc::new_cyclic(|this| Self {
+        Ok(Rc::new(Self {
             hwnd,
-            this: this.clone(),
             drop_target_helper: context.drop_target_helper.clone(),
             state,
             handle: context.handle,
@@ -228,15 +225,13 @@ impl WindowsWindowInner {
             windows_version: context.windows_version,
             validation_number: context.validation_number,
             main_receiver: context.main_receiver.clone(),
-            main_thread_id_win32: context.main_thread_id_win32,
+            platform_window_handle: context.platform_window_handle,
+            system_settings: RefCell::new(WindowsSystemSettings::new(context.display)),
         }))
     }
 
-    fn toggle_fullscreen(&self) {
-        let Some(this) = self.this.upgrade() else {
-            log::error!("Unable to toggle fullscreen: window has been dropped");
-            return;
-        };
+    fn toggle_fullscreen(self: &Rc<Self>) {
+        let this = self.clone();
         self.executor
             .spawn(async move {
                 let mut lock = this.state.borrow_mut();
@@ -246,34 +241,42 @@ impl WindowsWindowInner {
                     y,
                     cx,
                     cy,
-                } = if let Some(state) = lock.fullscreen.take() {
-                    state
-                } else {
-                    let (window_bounds, _) = lock.calculate_window_bounds();
-                    lock.fullscreen_restore_bounds = window_bounds;
-                    let style = WINDOW_STYLE(unsafe { get_window_long(this.hwnd, GWL_STYLE) } as _);
-                    let mut rc = RECT::default();
-                    unsafe { GetWindowRect(this.hwnd, &mut rc) }.log_err();
-                    let _ = lock.fullscreen.insert(StyleAndBounds {
-                        style,
-                        x: rc.left,
-                        y: rc.top,
-                        cx: rc.right - rc.left,
-                        cy: rc.bottom - rc.top,
-                    });
-                    let style = style
-                        & !(WS_THICKFRAME
-                            | WS_SYSMENU
-                            | WS_MAXIMIZEBOX
-                            | WS_MINIMIZEBOX
-                            | WS_CAPTION);
-                    let physical_bounds = lock.display.physical_bounds();
-                    StyleAndBounds {
-                        style,
-                        x: physical_bounds.left().0,
-                        y: physical_bounds.top().0,
-                        cx: physical_bounds.size.width.0,
-                        cy: physical_bounds.size.height.0,
+                } = match lock.fullscreen.take() {
+                    Some(state) => state,
+                    None => {
+                        let (window_bounds, _) = lock.calculate_window_bounds();
+                        lock.fullscreen_restore_bounds = window_bounds;
+                        drop(lock);
+
+                        let style =
+                            WINDOW_STYLE(unsafe { get_window_long(this.hwnd, GWL_STYLE) } as _);
+                        let mut rc = RECT::default();
+                        unsafe { GetWindowRect(this.hwnd, &mut rc) }
+                            .context("failed to get window rect")
+                            .log_err();
+
+                        lock = this.state.borrow_mut();
+                        let _ = lock.fullscreen.insert(StyleAndBounds {
+                            style,
+                            x: rc.left,
+                            y: rc.top,
+                            cx: rc.right - rc.left,
+                            cy: rc.bottom - rc.top,
+                        });
+                        let style = style
+                            & !(WS_THICKFRAME
+                                | WS_SYSMENU
+                                | WS_MAXIMIZEBOX
+                                | WS_MINIMIZEBOX
+                                | WS_CAPTION);
+                        let physical_bounds = lock.display.physical_bounds();
+                        StyleAndBounds {
+                            style,
+                            x: physical_bounds.left().0,
+                            y: physical_bounds.top().0,
+                            cx: physical_bounds.size.width.0,
+                            cy: physical_bounds.size.height.0,
+                        }
                     }
                 };
                 drop(lock);
@@ -294,21 +297,26 @@ impl WindowsWindowInner {
             .detach();
     }
 
-    fn set_window_placement(&self) -> Result<()> {
+    fn set_window_placement(self: &Rc<Self>) -> Result<()> {
         let Some(open_status) = self.state.borrow_mut().initial_placement.take() else {
             return Ok(());
         };
         match open_status.state {
             WindowOpenState::Maximized => unsafe {
-                SetWindowPlacement(self.hwnd, &open_status.placement)?;
+                SetWindowPlacement(self.hwnd, &open_status.placement)
+                    .context("failed to set window placement")?;
                 ShowWindowAsync(self.hwnd, SW_MAXIMIZE).ok()?;
             },
             WindowOpenState::Fullscreen => {
-                unsafe { SetWindowPlacement(self.hwnd, &open_status.placement)? };
+                unsafe {
+                    SetWindowPlacement(self.hwnd, &open_status.placement)
+                        .context("failed to set window placement")?
+                };
                 self.toggle_fullscreen();
             }
             WindowOpenState::Windowed => unsafe {
-                SetWindowPlacement(self.hwnd, &open_status.placement)?;
+                SetWindowPlacement(self.hwnd, &open_status.placement)
+                    .context("failed to set window placement")?;
             },
         }
         Ok(())
@@ -342,9 +350,10 @@ struct WindowCreateContext {
     drop_target_helper: IDropTargetHelper,
     validation_number: usize,
     main_receiver: flume::Receiver<Runnable>,
-    main_thread_id_win32: u32,
+    platform_window_handle: HWND,
     appearance: WindowAppearance,
     disable_direct_composition: bool,
+    directx_devices: DirectXDevices,
 }
 
 impl WindowsWindow {
@@ -361,8 +370,9 @@ impl WindowsWindow {
             drop_target_helper,
             validation_number,
             main_receiver,
-            main_thread_id_win32,
+            platform_window_handle,
             disable_direct_composition,
+            directx_devices,
         } = creation_info;
         register_window_class(icon);
         let hide_title_bar = params
@@ -382,10 +392,17 @@ impl WindowsWindow {
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
             (WS_EX_TOOLWINDOW, WINDOW_STYLE(0x0))
         } else {
-            (
-                WS_EX_APPWINDOW,
-                WS_THICKFRAME | WS_SYSMENU | WS_MAXIMIZEBOX | WS_MINIMIZEBOX,
-            )
+            let mut dwstyle = WS_SYSMENU;
+
+            if params.is_resizable {
+                dwstyle |= WS_THICKFRAME | WS_MAXIMIZEBOX;
+            }
+
+            if params.is_minimizable {
+                dwstyle |= WS_MINIMIZEBOX;
+            }
+
+            (WS_EX_APPWINDOW, dwstyle)
         };
         if !disable_direct_composition {
             dwexstyle |= WS_EX_NOREDIRECTIONBITMAP;
@@ -412,9 +429,10 @@ impl WindowsWindow {
             drop_target_helper,
             validation_number,
             main_receiver,
-            main_thread_id_win32,
+            platform_window_handle,
             appearance,
             disable_direct_composition,
+            directx_devices,
         };
         let creation_result = unsafe {
             CreateWindowExW(
@@ -632,10 +650,12 @@ impl PlatformWindow for WindowsWindow {
                     let mut btn_encoded = Vec::new();
                     for (index, btn) in answers.iter().enumerate() {
                         let encoded = HSTRING::from(btn.label().as_ref());
-                        let button_id = if btn.is_cancel() {
-                            IDCANCEL.0
-                        } else {
-                            index as i32 - 100
+                        let button_id = match btn {
+                            PromptButton::Ok(_) => IDOK.0,
+                            PromptButton::Cancel(_) => IDCANCEL.0,
+                            // the first few low integer values are reserved for known buttons
+                            // so for simplicity we just go backwards from -1
+                            PromptButton::Other(_) => -(index as i32) - 1,
                         };
                         button_id_map.push(button_id);
                         buttons.push(TASKDIALOG_BUTTON {
@@ -653,11 +673,11 @@ impl PlatformWindow for WindowsWindow {
                         .context("unable to create task dialog")
                         .log_err();
 
-                    let clicked = button_id_map
-                        .iter()
-                        .position(|&button_id| button_id == res)
-                        .unwrap();
-                    let _ = done_tx.send(clicked);
+                    if let Some(clicked) =
+                        button_id_map.iter().position(|&button_id| button_id == res)
+                    {
+                        let _ = done_tx.send(clicked);
+                    }
                 }
             })
             .detach();
@@ -672,8 +692,16 @@ impl PlatformWindow for WindowsWindow {
             .executor
             .spawn(async move {
                 this.set_window_placement().log_err();
-                unsafe { SetActiveWindow(hwnd).log_err() };
-                unsafe { SetFocus(Some(hwnd)).log_err() };
+
+                unsafe {
+                    // If the window is minimized, restore it.
+                    if IsIconic(hwnd).as_bool() {
+                        ShowWindowAsync(hwnd, SW_RESTORE).ok().log_err();
+                    }
+
+                    SetActiveWindow(hwnd).log_err();
+                    SetFocus(Some(hwnd)).log_err();
+                }
 
                 // premium ragebait by windows, this is needed because the window
                 // must have received an input event to be able to set itself to foreground
@@ -827,7 +855,7 @@ impl PlatformWindow for WindowsWindow {
         self.0.state.borrow().renderer.gpu_specs().log_err()
     }
 
-    fn update_ime_position(&self, _bounds: Bounds<ScaledPixels>) {
+    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
         // There is no such thing on Windows.
     }
 }

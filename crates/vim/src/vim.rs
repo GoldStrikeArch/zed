@@ -1017,12 +1017,12 @@ impl Vim {
         self.editor.upgrade()
     }
 
-    pub fn workspace(&self, window: &mut Window) -> Option<Entity<Workspace>> {
-        window.root::<Workspace>().flatten()
+    pub fn workspace(&self, window: &Window, cx: &App) -> Option<Entity<Workspace>> {
+        Workspace::for_window(window, cx)
     }
 
-    pub fn pane(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<Pane>> {
-        self.workspace(window)
+    pub fn pane(&self, window: &Window, cx: &Context<Self>) -> Option<Entity<Pane>> {
+        self.workspace(window, cx)
             .map(|workspace| workspace.read(cx).focused_pane(window, cx))
     }
 
@@ -1218,7 +1218,7 @@ impl Vim {
         self.update_editor(cx, |vim, editor, cx| {
             if last_mode != Mode::VisualBlock && last_mode.is_visual() && mode == Mode::VisualBlock
             {
-                vim.visual_block_motion(true, editor, window, cx, |_, point, goal| {
+                vim.visual_block_motion(true, editor, window, cx, &mut |_, point, goal| {
                     Some((point, goal))
                 })
             }
@@ -1276,7 +1276,7 @@ impl Vim {
                     vim.extended_pending_selection_id = s.pending_anchor().map(|p| p.id)
                 }
 
-                s.move_with(|map, selection| {
+                s.move_with(&mut |map, selection| {
                     if last_mode.is_visual() && !mode.is_visual() {
                         let mut point = selection.head();
                         if !selection.reversed && !selection.is_empty() {
@@ -1483,7 +1483,7 @@ impl Vim {
                 self.update_editor(cx, |_, editor, cx| {
                     editor.set_clip_at_line_ends(false, cx);
                     editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                        s.move_with(|_, selection| {
+                        s.move_with(&mut |_, selection| {
                             selection.collapse_to(selection.start, selection.goal)
                         })
                     });
@@ -1896,7 +1896,7 @@ impl Vim {
                     editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
                         match original_mode {
                             Some(Mode::VisualLine) => {
-                                s.move_with(|map, selection| {
+                                s.move_with(&mut |map, selection| {
                                     selection.collapse_to(
                                         map.prev_line_boundary(selection.start.to_point(map)).1,
                                         SelectionGoal::None,
@@ -1909,7 +1909,7 @@ impl Vim {
                                 s.select_anchors(vec![first]);
                             }
                             _ => {
-                                s.move_with(|map, selection| {
+                                s.move_with(&mut |map, selection| {
                                     selection.collapse_to(
                                         map.clip_at_line_end(selection.start),
                                         selection.goal,
@@ -1924,7 +1924,7 @@ impl Vim {
             Mode::Normal => {
                 self.update_editor(cx, |_, editor, cx| {
                     editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                        s.move_with(|map, selection| {
+                        s.move_with(&mut |map, selection| {
                             selection
                                 .collapse_to(map.clip_at_line_end(selection.end), selection.goal)
                         })
@@ -2098,7 +2098,7 @@ impl Vim {
                 Mode::HelixNormal | Mode::HelixSelect => {
                     self.update_editor(cx, |_, editor, cx| {
                         editor.change_selections(Default::default(), window, cx, |s| {
-                            s.move_with(|map, selection| {
+                            s.move_with(&mut |map, selection| {
                                 if selection.is_empty() {
                                     selection.end = movement::right(map, selection.start);
                                 }

@@ -12,6 +12,7 @@ use windows::{
     },
     Win32::{
         Foundation::{LPARAM, WPARAM},
+        Media::{timeBeginPeriod, timeEndPeriod},
         System::Threading::{
             GetCurrentThread, HIGH_PRIORITY_CLASS, SetPriorityClass, SetThreadPriority,
             THREAD_PRIORITY_TIME_CRITICAL,
@@ -22,7 +23,7 @@ use windows::{
 
 use crate::{
     GLOBAL_THREAD_TIMINGS, HWND, PlatformDispatcher, Priority, PriorityQueueSender,
-    RunnableVariant, SafeHwnd, THREAD_TIMINGS, TaskTiming, ThreadTaskTimings,
+    RunnableVariant, SafeHwnd, THREAD_TIMINGS, TaskTiming, ThreadTaskTimings, TimerResolutionGuard,
     WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD, profiler,
 };
 
@@ -112,9 +113,11 @@ impl PlatformDispatcher for WindowsDispatcher {
         ThreadTaskTimings::convert(&global_thread_timings)
     }
 
-    fn get_current_thread_timings(&self) -> Vec<crate::TaskTiming> {
+    fn get_current_thread_timings(&self) -> crate::ThreadTaskTimings {
         THREAD_TIMINGS.with(|timings| {
             let timings = timings.lock();
+            let thread_name = timings.thread_name.clone();
+            let total_pushed = timings.total_pushed;
             let timings = &timings.timings;
 
             let mut vec = Vec::with_capacity(timings.len());
@@ -122,7 +125,13 @@ impl PlatformDispatcher for WindowsDispatcher {
             let (s1, s2) = timings.as_slices();
             vec.extend_from_slice(s1);
             vec.extend_from_slice(s2);
-            vec
+
+            crate::ThreadTaskTimings {
+                thread_name,
+                thread_id: std::thread::current().id(),
+                timings: vec,
+                total_pushed,
+            }
         })
     }
 
@@ -192,5 +201,16 @@ impl PlatformDispatcher for WindowsDispatcher {
 
             f();
         });
+    }
+
+    fn increase_timer_resolution(&self) -> TimerResolutionGuard {
+        unsafe {
+            timeBeginPeriod(1);
+        }
+        TimerResolutionGuard {
+            cleanup: Some(Box::new(|| unsafe {
+                timeEndPeriod(1);
+            })),
+        }
     }
 }

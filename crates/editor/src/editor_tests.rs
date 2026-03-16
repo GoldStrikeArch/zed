@@ -5,6 +5,7 @@ use crate::{
     edit_prediction_tests::FakeEditPredictionDelegate,
     element::StickyHeader,
     linked_editing_ranges::LinkedEditingRanges,
+    runnables::RunnableTasks,
     scroll::scroll_amount::ScrollAmount,
     test::{
         assert_text_with_selections, build_editor, editor_content_with_blocks,
@@ -1863,6 +1864,56 @@ fn test_beginning_end_of_line(cx: &mut TestAppContext) {
                 DisplayPoint::new(DisplayRow(0), 0)..DisplayPoint::new(DisplayRow(0), 0),
                 DisplayPoint::new(DisplayRow(1), 0)..DisplayPoint::new(DisplayRow(1), 0),
             ]
+        );
+    });
+}
+
+#[gpui::test]
+fn test_beginning_of_line_single_line_editor(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    _ = editor.update(cx, |editor, window, cx| {
+        editor.set_text("  indented text", window, cx);
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+            s.select_display_ranges([
+                DisplayPoint::new(DisplayRow(0), 10)..DisplayPoint::new(DisplayRow(0), 10)
+            ]);
+        });
+
+        editor.move_to_beginning_of_line(
+            &MoveToBeginningOfLine {
+                stop_at_soft_wraps: true,
+                stop_at_indent: true,
+            },
+            window,
+            cx,
+        );
+        assert_eq!(
+            display_ranges(editor, cx),
+            &[DisplayPoint::new(DisplayRow(0), 0)..DisplayPoint::new(DisplayRow(0), 0)]
+        );
+    });
+
+    _ = editor.update(cx, |editor, window, cx| {
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+            s.select_display_ranges([
+                DisplayPoint::new(DisplayRow(0), 10)..DisplayPoint::new(DisplayRow(0), 10)
+            ]);
+        });
+
+        editor.select_to_beginning_of_line(
+            &SelectToBeginningOfLine {
+                stop_at_soft_wraps: true,
+                stop_at_indent: true,
+            },
+            window,
+            cx,
+        );
+        assert_eq!(
+            display_ranges(editor, cx),
+            &[DisplayPoint::new(DisplayRow(0), 10)..DisplayPoint::new(DisplayRow(0), 0)]
         );
     });
 }
@@ -6215,6 +6266,77 @@ async fn test_manipulate_text(cx: &mut TestAppContext) {
     });
     cx.assert_editor_state(indoc! {"
         «HeLlO, wOrLD!ˇ»
+    "});
+
+    // Test that case conversions backed by `to_case` preserve leading/trailing whitespace.
+    cx.set_state(indoc! {"
+        «    hello worldˇ»
+    "});
+    cx.update_editor(|e, window, cx| e.convert_to_title_case(&ConvertToTitleCase, window, cx));
+    cx.assert_editor_state(indoc! {"
+        «    Hello Worldˇ»
+    "});
+
+    cx.set_state(indoc! {"
+        «    hello worldˇ»
+    "});
+    cx.update_editor(|e, window, cx| {
+        e.convert_to_upper_camel_case(&ConvertToUpperCamelCase, window, cx)
+    });
+    cx.assert_editor_state(indoc! {"
+        «    HelloWorldˇ»
+    "});
+
+    cx.set_state(indoc! {"
+        «    hello worldˇ»
+    "});
+    cx.update_editor(|e, window, cx| {
+        e.convert_to_lower_camel_case(&ConvertToLowerCamelCase, window, cx)
+    });
+    cx.assert_editor_state(indoc! {"
+        «    helloWorldˇ»
+    "});
+
+    cx.set_state(indoc! {"
+        «    hello worldˇ»
+    "});
+    cx.update_editor(|e, window, cx| e.convert_to_snake_case(&ConvertToSnakeCase, window, cx));
+    cx.assert_editor_state(indoc! {"
+        «    hello_worldˇ»
+    "});
+
+    cx.set_state(indoc! {"
+        «    hello worldˇ»
+    "});
+    cx.update_editor(|e, window, cx| e.convert_to_kebab_case(&ConvertToKebabCase, window, cx));
+    cx.assert_editor_state(indoc! {"
+        «    hello-worldˇ»
+    "});
+
+    cx.set_state(indoc! {"
+        «    hello worldˇ»
+    "});
+    cx.update_editor(|e, window, cx| {
+        e.convert_to_sentence_case(&ConvertToSentenceCase, window, cx)
+    });
+    cx.assert_editor_state(indoc! {"
+        «    Hello worldˇ»
+    "});
+
+    cx.set_state(indoc! {"
+        «    hello world\t\tˇ»
+    "});
+    cx.update_editor(|e, window, cx| e.convert_to_title_case(&ConvertToTitleCase, window, cx));
+    cx.assert_editor_state(indoc! {"
+        «    Hello World\t\tˇ»
+    "});
+
+    cx.set_state(indoc! {"
+        «    hello world\t\tˇ»
+    "});
+    cx.update_editor(|e, window, cx| e.convert_to_snake_case(&ConvertToSnakeCase, window, cx));
+    cx.assert_editor_state(indoc! {"
+        «    hello_world\t\tˇ»
     "});
 
     // Test selections with `line_mode() = true`.
@@ -19207,6 +19329,260 @@ fn test_split_words_for_snippet_prefix() {
 }
 
 #[gpui::test]
+async fn test_move_to_syntax_node_relative_jumps(tcx: &mut TestAppContext) {
+    init_test(tcx, |_| {});
+
+    let mut cx = EditorLspTestContext::new(
+        Arc::into_inner(markdown_lang()).unwrap(),
+        Default::default(),
+        tcx,
+    )
+    .await;
+
+    async fn assert(offset: i8, before: &str, after: &str, cx: &mut EditorLspTestContext) {
+        let _state_context = cx.set_state(before);
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| editor.go_to_symbol_by_offset(window, cx, offset))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        cx.assert_editor_state(after);
+    }
+
+    const ABOVE: i8 = -1;
+    const BELOW: i8 = 1;
+
+    assert(
+        ABOVE,
+        indoc! {"
+        # Foo
+
+        ˇFoo foo foo
+
+        # Bar
+
+        Bar bar bar
+    "},
+        indoc! {"
+        ˇ# Foo
+
+        Foo foo foo
+
+        # Bar
+
+        Bar bar bar
+    "},
+        &mut cx,
+    )
+    .await;
+
+    assert(
+        ABOVE,
+        indoc! {"
+        ˇ# Foo
+
+        Foo foo foo
+
+        # Bar
+
+        Bar bar bar
+    "},
+        indoc! {"
+        ˇ# Foo
+
+        Foo foo foo
+
+        # Bar
+
+        Bar bar bar
+    "},
+        &mut cx,
+    )
+    .await;
+
+    assert(
+        BELOW,
+        indoc! {"
+        ˇ# Foo
+
+        Foo foo foo
+
+        # Bar
+
+        Bar bar bar
+    "},
+        indoc! {"
+        # Foo
+
+        Foo foo foo
+
+        ˇ# Bar
+
+        Bar bar bar
+    "},
+        &mut cx,
+    )
+    .await;
+
+    assert(
+        BELOW,
+        indoc! {"
+        # Foo
+
+        ˇFoo foo foo
+
+        # Bar
+
+        Bar bar bar
+    "},
+        indoc! {"
+        # Foo
+
+        Foo foo foo
+
+        ˇ# Bar
+
+        Bar bar bar
+    "},
+        &mut cx,
+    )
+    .await;
+
+    assert(
+        BELOW,
+        indoc! {"
+        # Foo
+
+        Foo foo foo
+
+        ˇ# Bar
+
+        Bar bar bar
+    "},
+        indoc! {"
+        # Foo
+
+        Foo foo foo
+
+        ˇ# Bar
+
+        Bar bar bar
+    "},
+        &mut cx,
+    )
+    .await;
+
+    assert(
+        BELOW,
+        indoc! {"
+        # Foo
+
+        Foo foo foo
+
+        # Bar
+        ˇ
+        Bar bar bar
+    "},
+        indoc! {"
+        # Foo
+
+        Foo foo foo
+
+        # Bar
+        ˇ
+        Bar bar bar
+    "},
+        &mut cx,
+    )
+    .await;
+}
+
+#[gpui::test]
+async fn test_move_to_syntax_node_relative_dead_zone(tcx: &mut TestAppContext) {
+    init_test(tcx, |_| {});
+
+    let mut cx = EditorLspTestContext::new(
+        Arc::into_inner(rust_lang()).unwrap(),
+        Default::default(),
+        tcx,
+    )
+    .await;
+
+    async fn assert(offset: i8, before: &str, after: &str, cx: &mut EditorLspTestContext) {
+        let _state_context = cx.set_state(before);
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| editor.go_to_symbol_by_offset(window, cx, offset))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        cx.assert_editor_state(after);
+    }
+
+    const ABOVE: i8 = -1;
+    const BELOW: i8 = 1;
+
+    assert(
+        ABOVE,
+        indoc! {"
+        fn foo() {
+            // foo fn
+        }
+
+        ˇ// this zone is not inside any top level outline node
+
+        fn bar() {
+            // bar fn
+            let _ = 2;
+        }
+    "},
+        indoc! {"
+        ˇfn foo() {
+            // foo fn
+        }
+
+        // this zone is not inside any top level outline node
+
+        fn bar() {
+            // bar fn
+            let _ = 2;
+        }
+    "},
+        &mut cx,
+    )
+    .await;
+
+    assert(
+        BELOW,
+        indoc! {"
+        fn foo() {
+            // foo fn
+        }
+
+        ˇ// this zone is not inside any top level outline node
+
+        fn bar() {
+            // bar fn
+            let _ = 2;
+        }
+    "},
+        indoc! {"
+        fn foo() {
+            // foo fn
+        }
+
+        // this zone is not inside any top level outline node
+
+        ˇfn bar() {
+            // bar fn
+            let _ = 2;
+        }
+    "},
+        &mut cx,
+    )
+    .await;
+}
+
+#[gpui::test]
 async fn test_move_to_enclosing_bracket(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -19764,6 +20140,100 @@ async fn test_completions_with_additional_edits(cx: &mut TestAppContext) {
     .unwrap();
     apply_additional_edits.await.unwrap();
     cx.assert_editor_state("fn main() { let a = Some(2)ˇ; }");
+}
+
+#[gpui::test]
+async fn test_completions_with_additional_edits_and_multiple_cursors(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorLspTestContext::new_typescript(
+        lsp::ServerCapabilities {
+            completion_provider: Some(lsp::CompletionOptions {
+                resolve_provider: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        cx,
+    )
+    .await;
+
+    cx.set_state(
+        "import { «Fooˇ» } from './types';\n\nclass Bar {\n    method(): «Fooˇ» { return new Foo(); }\n}",
+    );
+
+    cx.simulate_keystroke("F");
+    cx.simulate_keystroke("o");
+
+    let completion_item = lsp::CompletionItem {
+        label: "FooBar".into(),
+        kind: Some(lsp::CompletionItemKind::CLASS),
+        text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
+            range: lsp::Range {
+                start: lsp::Position {
+                    line: 3,
+                    character: 14,
+                },
+                end: lsp::Position {
+                    line: 3,
+                    character: 16,
+                },
+            },
+            new_text: "FooBar".to_string(),
+        })),
+        additional_text_edits: Some(vec![lsp::TextEdit {
+            range: lsp::Range {
+                start: lsp::Position {
+                    line: 0,
+                    character: 9,
+                },
+                end: lsp::Position {
+                    line: 0,
+                    character: 11,
+                },
+            },
+            new_text: "FooBar".to_string(),
+        }]),
+        ..Default::default()
+    };
+
+    let closure_completion_item = completion_item.clone();
+    let mut request = cx.set_request_handler::<lsp::request::Completion, _, _>(move |_, _, _| {
+        let task_completion_item = closure_completion_item.clone();
+        async move {
+            Ok(Some(lsp::CompletionResponse::Array(vec![
+                task_completion_item,
+            ])))
+        }
+    });
+
+    request.next().await;
+
+    cx.condition(|editor, _| editor.context_menu_visible())
+        .await;
+    let apply_additional_edits = cx.update_editor(|editor, window, cx| {
+        editor
+            .confirm_completion(&ConfirmCompletion::default(), window, cx)
+            .unwrap()
+    });
+
+    cx.assert_editor_state(
+        "import { FooBarˇ } from './types';\n\nclass Bar {\n    method(): FooBarˇ { return new Foo(); }\n}",
+    );
+
+    cx.set_request_handler::<lsp::request::ResolveCompletionItem, _, _>(move |_, _, _| {
+        let task_completion_item = completion_item.clone();
+        async move { Ok(task_completion_item) }
+    })
+    .next()
+    .await
+    .unwrap();
+
+    apply_additional_edits.await.unwrap();
+
+    cx.assert_editor_state(
+        "import { FooBarˇ } from './types';\n\nclass Bar {\n    method(): FooBarˇ { return new Foo(); }\n}",
+    );
 }
 
 #[gpui::test]
@@ -24403,20 +24873,24 @@ async fn test_find_enclosing_node_with_task(cx: &mut TestAppContext) {
 
     editor.update_in(cx, |editor, window, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
-        editor.tasks.insert(
-            (buffer.read(cx).remote_id(), 3),
+        editor.runnables.insert(
+            buffer.read(cx).remote_id(),
+            3,
+            buffer.read(cx).version(),
             RunnableTasks {
-                templates: vec![],
+                templates: Vec::new(),
                 offset: snapshot.anchor_before(MultiBufferOffset(43)),
                 column: 0,
                 extra_variables: HashMap::default(),
                 context_range: BufferOffset(43)..BufferOffset(85),
             },
         );
-        editor.tasks.insert(
-            (buffer.read(cx).remote_id(), 8),
+        editor.runnables.insert(
+            buffer.read(cx).remote_id(),
+            8,
+            buffer.read(cx).version(),
             RunnableTasks {
-                templates: vec![],
+                templates: Vec::new(),
                 offset: snapshot.anchor_before(MultiBufferOffset(86)),
                 column: 0,
                 extra_variables: HashMap::default(),

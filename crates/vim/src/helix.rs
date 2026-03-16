@@ -14,6 +14,7 @@ use editor::{
 };
 use gpui::actions;
 use gpui::{Context, Font, Hsla, Pixels, Window, WindowTextSystem};
+use itertools::Itertools as _;
 use language::{CharClassifier, CharKind, Point, Selection};
 use multi_buffer::MultiBufferSnapshot;
 use search::{BufferSearchBar, SearchOptions};
@@ -46,6 +47,8 @@ actions!(
         HelixInsert,
         /// Appends at the end of the selection.
         HelixAppend,
+        /// Inserts at the end of the current Helix cursor line.
+        HelixInsertEndOfLine,
         /// Goes to the location of the last modification.
         HelixGotoLastModification,
         /// Select entire line or multiple lines, extending downwards.
@@ -76,6 +79,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     Vim::action(editor, cx, Vim::helix_select_lines);
     Vim::action(editor, cx, Vim::helix_insert);
     Vim::action(editor, cx, Vim::helix_append);
+    Vim::action(editor, cx, Vim::helix_insert_end_of_line);
     Vim::action(editor, cx, Vim::helix_yank);
     Vim::action(editor, cx, Vim::helix_goto_last_modification);
     Vim::action(editor, cx, Vim::helix_paste);
@@ -613,6 +617,34 @@ impl Vim {
         });
     }
 
+    /// Helix-specific implementation of `shift-a` that accounts for Helix's
+    /// selection model, where selecting a line with `x` creates a selection
+    /// from column 0 of the current row to column 0 of the next row, so the
+    /// default [`vim::normal::InsertEndOfLine`] would move the cursor to the
+    /// end of the wrong line.
+    fn helix_insert_end_of_line(
+        &mut self,
+        _: &HelixInsertEndOfLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_recording(cx);
+        self.switch_mode(Mode::Insert, false, window, cx);
+        self.update_editor(cx, |_, editor, cx| {
+            editor.change_selections(Default::default(), window, cx, |s| {
+                s.move_with(&mut |map, selection| {
+                    let cursor = if !selection.is_empty() && !selection.reversed {
+                        movement::left(map, selection.head())
+                    } else {
+                        selection.head()
+                    };
+                    selection
+                        .collapse_to(motion::next_line_end(map, cursor, 1), SelectionGoal::None);
+                });
+            });
+        });
+    }
+
     pub fn helix_replace(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.update_editor(cx, |_, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
@@ -858,11 +890,22 @@ impl Vim {
             self.update_editor(cx, |_vim, editor, cx| {
                 let snapshot = editor.snapshot(window, cx);
                 editor.change_selections(SelectionEffects::default(), window, cx, |s| {
+                    let buffer = snapshot.buffer_snapshot();
+
                     s.select_anchor_ranges(
                         prior_selections
                             .iter()
                             .cloned()
-                            .chain(s.all_anchors(&snapshot).iter().map(|s| s.range())),
+                            .chain(s.all_anchors(&snapshot).iter().map(|s| s.range()))
+                            .sorted_by(|a, b| {
+                                a.start
+                                    .cmp(&b.start, buffer)
+                                    .then_with(|| a.end.cmp(&b.end, buffer))
+                            })
+                            .dedup_by(|a, b| {
+                                a.start.cmp(&b.start, buffer).is_eq()
+                                    && a.end.cmp(&b.end, buffer).is_eq()
+                            }),
                     );
                 })
             });
@@ -2162,6 +2205,47 @@ mod test {
             ˇ»line five"},
             Mode::HelixNormal,
         );
+
+        // Test selecting with an empty line below the current line
+        cx.set_state(
+            indoc! {"
+            line one
+            line twoˇ
+
+            line four
+            line five"},
+            Mode::HelixNormal,
+        );
+        cx.simulate_keystrokes("x");
+        cx.assert_state(
+            indoc! {"
+            line one
+            «line two
+            ˇ»
+            line four
+            line five"},
+            Mode::HelixNormal,
+        );
+        cx.simulate_keystrokes("x");
+        cx.assert_state(
+            indoc! {"
+            line one
+            «line two
+
+            ˇ»line four
+            line five"},
+            Mode::HelixNormal,
+        );
+        cx.simulate_keystrokes("x");
+        cx.assert_state(
+            indoc! {"
+            line one
+            «line two
+
+            line four
+            ˇ»line five"},
+            Mode::HelixNormal,
+        );
     }
 
     #[gpui::test]
@@ -2310,6 +2394,25 @@ mod test {
         cx.simulate_keystrokes("/ o n e");
         cx.simulate_keystrokes("enter");
         cx.simulate_keystrokes("n n");
+        cx.assert_state("hello two «oneˇ» two «oneˇ» two «oneˇ»", Mode::HelixSelect);
+    }
+
+    #[gpui::test]
+    async fn test_helix_select_next_match_wrapping(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+
+        // Three occurrences of "one". After selecting all three with `n n`,
+        // pressing `n` again wraps the search to the first occurrence.
+        // The prior selections (at higher offsets) are chained before the
+        // wrapped selection (at a lower offset), producing unsorted anchors
+        // that cause `rope::Cursor::summary` to panic with
+        // "cannot summarize backward".
+        cx.set_state("ˇhello two one two one two one", Mode::HelixSelect);
+        cx.simulate_keystrokes("/ o n e");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_keystrokes("n n n");
+        // Should not panic; all three occurrences should remain selected.
         cx.assert_state("hello two «oneˇ» two «oneˇ» two «oneˇ»", Mode::HelixSelect);
     }
 
@@ -2575,6 +2678,53 @@ mod test {
             line «four
             line fiveˇ»"},
             Mode::HelixSelect,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_helix_insert_end_of_line(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+
+        // Ensure that, when lines are selected using `x`, pressing `shift-a`
+        // actually puts the cursor at the end of the selected lines and not at
+        // the end of the line below.
+        cx.set_state(
+            indoc! {"
+            line oˇne
+            line two"},
+            Mode::HelixNormal,
+        );
+
+        cx.simulate_keystrokes("x");
+        cx.assert_state(
+            indoc! {"
+            «line one
+            ˇ»line two"},
+            Mode::HelixNormal,
+        );
+
+        cx.simulate_keystrokes("shift-a");
+        cx.assert_state(
+            indoc! {"
+            line oneˇ
+            line two"},
+            Mode::Insert,
+        );
+
+        cx.set_state(
+            indoc! {"
+            line «one
+            lineˇ» two"},
+            Mode::HelixNormal,
+        );
+
+        cx.simulate_keystrokes("shift-a");
+        cx.assert_state(
+            indoc! {"
+            line one
+            line twoˇ"},
+            Mode::Insert,
         );
     }
 }

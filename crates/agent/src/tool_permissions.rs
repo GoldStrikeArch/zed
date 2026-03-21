@@ -578,6 +578,7 @@ mod tests {
             inline_assistant_use_streaming_tools: false,
             commit_message_model: None,
             thread_summary_model: None,
+            subagent_model: None,
             inline_alternatives: vec![],
             favorite_models: vec![],
             default_profile: AgentProfileId::default(),

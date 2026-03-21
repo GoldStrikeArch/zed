@@ -539,6 +539,7 @@ fn update_active_language_model_from_settings(cx: &mut App) {
         .thread_summary_model
         .as_ref()
         .map(to_selected_model);
+    let subagent = settings.subagent_model.as_ref().map(to_selected_model);
     let inline_alternatives = settings
         .inline_alternatives
         .iter()
@@ -550,6 +551,7 @@ fn update_active_language_model_from_settings(cx: &mut App) {
         registry.select_inline_assistant_model(inline_assistant.as_ref(), cx);
         registry.select_commit_message_model(commit_message.as_ref(), cx);
         registry.select_thread_summary_model(thread_summary.as_ref(), cx);
+        registry.select_subagent_model(subagent.as_ref(), cx);
         registry.select_inline_alternative_models(inline_alternatives, cx);
     });
 }
@@ -617,6 +619,7 @@ mod tests {
             inline_assistant_use_streaming_tools: false,
             commit_message_model: None,
             thread_summary_model: None,
+            subagent_model: None,
             inline_alternatives: vec![],
             favorite_models: vec![],
             default_profile: AgentProfileId::default(),

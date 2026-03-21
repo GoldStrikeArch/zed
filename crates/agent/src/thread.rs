@@ -982,12 +982,38 @@ impl Thread {
             .embedded_context(true)
     }
 
+    fn explicit_subagent_model_is_active(cx: &App) -> bool {
+        AgentSettings::get_global(cx)
+            .subagent_model
+            .as_ref()
+            .and_then(|selection| Self::resolve_model_from_selection(selection, cx))
+            .is_some_and(|model| model.supports_tools())
+    }
+
+    fn uses_dedicated_subagent_generation_settings(&self, cx: &App) -> bool {
+        self.is_subagent() && Self::explicit_subagent_model_is_active(cx)
+    }
+
     pub fn new_subagent(parent_thread: &Entity<Thread>, cx: &mut Context<Self>) -> Self {
         let project = parent_thread.read(cx).project.clone();
         let project_context = parent_thread.read(cx).project_context.clone();
         let context_server_registry = parent_thread.read(cx).context_server_registry.clone();
         let templates = parent_thread.read(cx).templates.clone();
-        let model = parent_thread.read(cx).model().cloned();
+        let settings = AgentSettings::get_global(cx);
+        let subagent_selection = settings.subagent_model.clone();
+        let explicit_subagent_model = subagent_selection
+            .as_ref()
+            .and_then(|selection| Self::resolve_model_from_selection(selection, cx))
+            .filter(|model| model.supports_tools());
+        let model = explicit_subagent_model
+            .clone()
+            .or_else(|| {
+                LanguageModelRegistry::try_read_global(cx)?
+                    .default_model()
+                    .map(|configured| configured.model)
+                    .filter(|model| model.supports_tools())
+            })
+            .or_else(|| parent_thread.read(cx).model().cloned());
         let parent_action_log = parent_thread.read(cx).action_log().clone();
         let action_log =
             cx.new(|_cx| ActionLog::new(project.clone()).with_linked_action_log(parent_action_log));
@@ -1000,6 +1026,12 @@ impl Thread {
             action_log,
             cx,
         );
+        if explicit_subagent_model.is_some() {
+            if let Some(selection) = subagent_selection {
+                thread.thinking_enabled = selection.enable_thinking;
+                thread.thinking_effort = selection.effort;
+            }
+        }
         thread.subagent_context = Some(SubagentContext {
             parent_thread_id: parent_thread.read(cx).id().clone(),
             depth: parent_thread.read(cx).depth() + 1,
@@ -1407,10 +1439,12 @@ impl Thread {
         }
         self.prompt_capabilities_tx.send(new_caps).log_err();
 
-        for subagent in &self.running_subagents {
-            subagent
-                .update(cx, |thread, cx| thread.set_model(model.clone(), cx))
-                .ok();
+        if !Self::explicit_subagent_model_is_active(cx) {
+            for subagent in &self.running_subagents {
+                subagent
+                    .update(cx, |thread, cx| thread.set_model(model.clone(), cx))
+                    .ok();
+            }
         }
 
         cx.notify()
@@ -1444,10 +1478,12 @@ impl Thread {
     pub fn set_thinking_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.thinking_enabled = enabled;
 
-        for subagent in &self.running_subagents {
-            subagent
-                .update(cx, |thread, cx| thread.set_thinking_enabled(enabled, cx))
-                .ok();
+        if !Self::explicit_subagent_model_is_active(cx) {
+            for subagent in &self.running_subagents {
+                subagent
+                    .update(cx, |thread, cx| thread.set_thinking_enabled(enabled, cx))
+                    .ok();
+            }
         }
         cx.notify();
     }
@@ -1459,12 +1495,14 @@ impl Thread {
     pub fn set_thinking_effort(&mut self, effort: Option<String>, cx: &mut Context<Self>) {
         self.thinking_effort = effort.clone();
 
-        for subagent in &self.running_subagents {
-            subagent
-                .update(cx, |thread, cx| {
-                    thread.set_thinking_effort(effort.clone(), cx)
-                })
-                .ok();
+        if !Self::explicit_subagent_model_is_active(cx) {
+            for subagent in &self.running_subagents {
+                subagent
+                    .update(cx, |thread, cx| {
+                        thread.set_thinking_effort(effort.clone(), cx)
+                    })
+                    .ok();
+            }
         }
         cx.notify();
     }
@@ -1476,10 +1514,12 @@ impl Thread {
     pub fn set_speed(&mut self, speed: Speed, cx: &mut Context<Self>) {
         self.speed = Some(speed);
 
-        for subagent in &self.running_subagents {
-            subagent
-                .update(cx, |thread, cx| thread.set_speed(speed, cx))
-                .ok();
+        if !Self::explicit_subagent_model_is_active(cx) {
+            for subagent in &self.running_subagents {
+                subagent
+                    .update(cx, |thread, cx| thread.set_speed(speed, cx))
+                    .ok();
+            }
         }
         cx.notify();
     }
@@ -1575,9 +1615,11 @@ impl Thread {
 
         self.profile_id = profile_id.clone();
 
-        // Swap to the profile's preferred model when available.
-        if let Some(model) = Self::resolve_profile_model(&self.profile_id, cx) {
-            self.set_model(model, cx);
+        // A dedicated subagent model should remain stable even when the parent thread profile changes.
+        if !self.uses_dedicated_subagent_generation_settings(cx) {
+            if let Some(model) = Self::resolve_profile_model(&self.profile_id, cx) {
+                self.set_model(model, cx);
+            }
         }
 
         for subagent in &self.running_subagents {
@@ -1696,7 +1738,7 @@ impl Thread {
     /// Look up the active profile and resolve its preferred model if one is configured.
     fn resolve_profile_model(
         profile_id: &AgentProfileId,
-        cx: &mut Context<Self>,
+        cx: &App,
     ) -> Option<Arc<dyn LanguageModel>> {
         let selection = AgentSettings::get_global(cx)
             .profiles
@@ -1709,17 +1751,19 @@ impl Thread {
     /// Translate a stored model selection into the configured model from the registry.
     fn resolve_model_from_selection(
         selection: &LanguageModelSelection,
-        cx: &mut Context<Self>,
+        cx: &App,
     ) -> Option<Arc<dyn LanguageModel>> {
         let selected = SelectedModel {
             provider: LanguageModelProviderId::from(selection.provider.0.clone()),
             model: LanguageModelId::from(selection.model.clone()),
         };
-        LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
-            registry
-                .select_model(&selected, cx)
-                .map(|configured| configured.model)
-        })
+        let registry = LanguageModelRegistry::try_read_global(cx)?;
+        let provider = registry.provider(&selected.provider)?;
+        provider
+            .provided_models(cx)
+            .iter()
+            .find(|model| model.id() == selected.model)
+            .cloned()
     }
 
     pub fn resume(
@@ -4035,16 +4079,117 @@ fn convert_image(image_content: acp::ImageContent) -> LanguageModelImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
-    use language_model::LanguageModelToolUseId;
-    use language_model::fake_provider::FakeLanguageModel;
+    use futures::{future::BoxFuture, stream::BoxStream};
+    use gpui::{BorrowAppContext, TestAppContext};
+    use language_model::fake_provider::{FakeLanguageModel, FakeLanguageModelProvider};
+    use language_model::{
+        LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelId,
+        LanguageModelName, LanguageModelProviderId, LanguageModelProviderName,
+        LanguageModelRegistry, LanguageModelRequest, LanguageModelToolChoice,
+        LanguageModelToolUseId,
+    };
     use serde_json::json;
     use std::sync::Arc;
+
+    struct ToolCapableTestLanguageModel {
+        inner: FakeLanguageModel,
+    }
+
+    impl ToolCapableTestLanguageModel {
+        fn new(
+            provider_id: &str,
+            model_id: &str,
+            model_name: &str,
+            supports_thinking: bool,
+        ) -> Self {
+            Self {
+                inner: FakeLanguageModel::with_id_and_thinking(
+                    provider_id,
+                    model_id,
+                    model_name,
+                    supports_thinking,
+                ),
+            }
+        }
+    }
+
+    impl LanguageModel for ToolCapableTestLanguageModel {
+        fn id(&self) -> LanguageModelId {
+            self.inner.id()
+        }
+
+        fn name(&self) -> LanguageModelName {
+            self.inner.name()
+        }
+
+        fn provider_id(&self) -> LanguageModelProviderId {
+            self.inner.provider_id()
+        }
+
+        fn provider_name(&self) -> LanguageModelProviderName {
+            self.inner.provider_name()
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn supports_tool_choice(&self, choice: LanguageModelToolChoice) -> bool {
+            self.inner.supports_tool_choice(choice)
+        }
+
+        fn supports_images(&self) -> bool {
+            self.inner.supports_images()
+        }
+
+        fn supports_thinking(&self) -> bool {
+            self.inner.supports_thinking()
+        }
+
+        fn telemetry_id(&self) -> String {
+            self.inner.telemetry_id()
+        }
+
+        fn max_token_count(&self) -> u64 {
+            self.inner.max_token_count()
+        }
+
+        fn count_tokens(
+            &self,
+            request: LanguageModelRequest,
+            cx: &App,
+        ) -> BoxFuture<'static, http_client::Result<u64>> {
+            self.inner.count_tokens(request, cx)
+        }
+
+        fn stream_completion(
+            &self,
+            request: LanguageModelRequest,
+            cx: &AsyncApp,
+        ) -> BoxFuture<
+            'static,
+            Result<
+                BoxStream<
+                    'static,
+                    Result<LanguageModelCompletionEvent, LanguageModelCompletionError>,
+                >,
+                LanguageModelCompletionError,
+            >,
+        > {
+            self.inner.stream_completion(request, cx)
+        }
+
+        #[cfg(any(test, feature = "test-support"))]
+        fn as_fake(&self) -> &FakeLanguageModel {
+            self.inner.as_fake()
+        }
+    }
 
     async fn setup_thread_for_test(cx: &mut TestAppContext) -> (Entity<Thread>, ThreadEventStream) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
+            LanguageModelRegistry::test(cx);
         });
 
         let fs = fs::FakeFs::new(cx.background_executor.clone());
@@ -4093,6 +4238,97 @@ mod tests {
         })
     }
 
+    fn register_test_model(
+        cx: &mut TestAppContext,
+        provider_id: &str,
+        model_id: &str,
+        model_name: &str,
+        supports_thinking: bool,
+    ) -> Arc<dyn LanguageModel> {
+        let model: Arc<dyn LanguageModel> = Arc::new(ToolCapableTestLanguageModel::new(
+            provider_id,
+            model_id,
+            model_name,
+            supports_thinking,
+        ));
+
+        cx.update(|cx| {
+            let provider = Arc::new(
+                FakeLanguageModelProvider::new(
+                    LanguageModelProviderId::from(provider_id.to_string()),
+                    LanguageModelProviderName::from(format!("{provider_id} provider")),
+                )
+                .with_models(vec![model.clone()]),
+            );
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.register_provider(provider, cx);
+            });
+        });
+
+        model
+    }
+
+    fn selection(
+        provider_id: &str,
+        model_id: &str,
+        enable_thinking: bool,
+        effort: Option<&str>,
+    ) -> LanguageModelSelection {
+        LanguageModelSelection {
+            provider: provider_id.into(),
+            model: model_id.to_string(),
+            enable_thinking,
+            effort: effort.map(ToOwned::to_owned),
+        }
+    }
+
+    fn configure_subagent_model(cx: &mut TestAppContext, selection: LanguageModelSelection) {
+        let selected_model = SelectedModel {
+            provider: LanguageModelProviderId::from(selection.provider.0.clone()),
+            model: LanguageModelId::from(selection.model.clone()),
+        };
+
+        cx.update(|cx| {
+            cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.agent.get_or_insert_default().subagent_model = Some(selection.clone());
+                });
+            });
+
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.select_subagent_model(Some(&selected_model), cx);
+            });
+        });
+    }
+
+    fn configure_profile_model(
+        cx: &mut TestAppContext,
+        profile_id: &str,
+        selection: LanguageModelSelection,
+    ) {
+        cx.update(|cx| {
+            cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    let profiles = settings
+                        .agent
+                        .get_or_insert_default()
+                        .profiles
+                        .get_or_insert_default();
+                    profiles.insert(
+                        profile_id.into(),
+                        settings::AgentProfileContent {
+                            name: profile_id.into(),
+                            tools: Default::default(),
+                            enable_all_context_servers: Some(false),
+                            context_servers: Default::default(),
+                            default_model: Some(selection.clone()),
+                        },
+                    );
+                });
+            });
+        });
+    }
+
     #[gpui::test]
     async fn test_set_model_propagates_to_subagents(cx: &mut TestAppContext) {
         let (parent, _event_stream) = setup_thread_for_test(cx).await;
@@ -4118,6 +4354,80 @@ mod tests {
                     "Subagent model should match parent model after set_model"
                 );
             }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_parent_generation_settings_do_not_override_configured_subagent_model(
+        cx: &mut TestAppContext,
+    ) {
+        let (parent, _event_stream) = setup_thread_for_test(cx).await;
+        let dedicated_model = register_test_model(
+            cx,
+            "subagent-provider",
+            "subagent-model",
+            "Subagent Model",
+            true,
+        );
+        let parent_model =
+            register_test_model(cx, "parent-provider", "parent-model", "Parent Model", false);
+
+        configure_subagent_model(
+            cx,
+            selection("subagent-provider", "subagent-model", true, Some("high")),
+        );
+
+        let subagents = setup_parent_with_subagents(cx, &parent, 1);
+        let subagent = &subagents[0];
+
+        cx.update(|cx| {
+            assert_eq!(
+                subagent.read(cx).model().unwrap().id(),
+                dedicated_model.id(),
+                "Configured subagent model should be used when the subagent starts",
+            );
+            assert!(
+                subagent.read(cx).thinking_enabled(),
+                "Configured subagent thinking should be applied when the override is active",
+            );
+            assert_eq!(
+                subagent
+                    .read(cx)
+                    .thinking_effort()
+                    .map(|effort| effort.as_str()),
+                Some("high"),
+                "Configured subagent effort should be applied when the override is active",
+            );
+
+            parent.update(cx, |thread, cx| {
+                thread.set_model(parent_model.clone(), cx);
+                thread.set_thinking_enabled(false, cx);
+                thread.set_thinking_effort(Some("low".to_string()), cx);
+                thread.set_speed(Speed::Fast, cx);
+            });
+
+            assert_eq!(
+                subagent.read(cx).model().unwrap().id(),
+                dedicated_model.id(),
+                "Parent model changes should not overwrite the configured subagent model",
+            );
+            assert!(
+                subagent.read(cx).thinking_enabled(),
+                "Parent thinking changes should not overwrite the configured subagent setting",
+            );
+            assert_eq!(
+                subagent
+                    .read(cx)
+                    .thinking_effort()
+                    .map(|effort| effort.as_str()),
+                Some("high"),
+                "Parent effort changes should not overwrite the configured subagent setting",
+            );
+            assert_eq!(
+                subagent.read(cx).speed(),
+                None,
+                "Parent speed changes should not retune a subagent with a dedicated model override",
+            );
         });
     }
 
@@ -4229,6 +4539,51 @@ mod tests {
                     "Subagent speed should match parent after set_speed"
                 );
             }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_profile_model_does_not_override_configured_subagent_model(
+        cx: &mut TestAppContext,
+    ) {
+        let (parent, _event_stream) = setup_thread_for_test(cx).await;
+        let dedicated_model = register_test_model(
+            cx,
+            "subagent-provider",
+            "subagent-model",
+            "Subagent Model",
+            true,
+        );
+        register_test_model(
+            cx,
+            "profile-provider",
+            "profile-model",
+            "Profile Model",
+            false,
+        );
+
+        configure_subagent_model(
+            cx,
+            selection("subagent-provider", "subagent-model", true, Some("high")),
+        );
+        configure_profile_model(
+            cx,
+            "profile-a",
+            selection("profile-provider", "profile-model", false, None),
+        );
+
+        let subagent = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent, cx)));
+
+        cx.update(|cx| {
+            subagent.update(cx, |thread, cx| {
+                thread.set_profile(AgentProfileId("profile-a".into()), cx);
+            });
+
+            assert_eq!(
+                subagent.read(cx).model().unwrap().id(),
+                dedicated_model.id(),
+                "Profile changes should not replace a configured subagent model override",
+            );
         });
     }
 

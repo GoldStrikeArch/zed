@@ -103,11 +103,11 @@ use {
     feature_flags::FeatureFlagAppExt as _,
     git_ui::project_diff::ProjectDiff,
     gpui::{
-        Action as _, App, AppContext as _, Bounds, KeyBinding, Modifiers, VisualTestAppContext,
+        App, AppContext as _, Bounds, Entity, KeyBinding, Modifiers, VisualTestAppContext,
         WindowBounds, WindowHandle, WindowOptions, point, px, size,
     },
     image::RgbaImage,
-    project::AgentId,
+    project::{AgentId, Project},
     project_panel::ProjectPanel,
     settings::{NotifyWhenAgentWaiting, Settings as _},
     settings_ui::SettingsWindow,
@@ -1966,6 +1966,7 @@ impl AgentServer for StubAgentServer {
     fn connect(
         &self,
         _delegate: AgentServerDelegate,
+        _project: Entity<Project>,
         _cx: &mut App,
     ) -> gpui::Task<gpui::Result<Rc<dyn AgentConnection>>> {
         gpui::Task::ready(Ok(Rc::new(self.connection.clone())))
@@ -2650,6 +2651,22 @@ fn run_multi_workspace_sidebar_visual_tests(
 
     cx.run_until_parked();
 
+    // Create the sidebar and register it on the MultiWorkspace
+    let sidebar = multi_workspace_window
+        .update(cx, |_multi_workspace, window, cx| {
+            let multi_workspace_handle = cx.entity();
+            cx.new(|cx| sidebar::Sidebar::new(multi_workspace_handle, window, cx))
+        })
+        .context("Failed to create sidebar")?;
+
+    multi_workspace_window
+        .update(cx, |multi_workspace, _window, cx| {
+            multi_workspace.register_sidebar(sidebar.clone(), cx);
+        })
+        .context("Failed to register sidebar")?;
+
+    cx.run_until_parked();
+
     // Save test threads to the ThreadStore for each workspace
     let save_tasks = multi_workspace_window
         .update(cx, |multi_workspace, _window, cx| {
@@ -2727,8 +2744,8 @@ fn run_multi_workspace_sidebar_visual_tests(
 
     // Open the sidebar
     multi_workspace_window
-        .update(cx, |_multi_workspace, window, cx| {
-            window.dispatch_action(workspace::ToggleWorkspaceSidebar.boxed_clone(), cx);
+        .update(cx, |multi_workspace, window, cx| {
+            multi_workspace.toggle_sidebar(window, cx);
         })
         .context("Failed to toggle sidebar")?;
 
@@ -3166,10 +3183,24 @@ edition = "2021"
 
     cx.run_until_parked();
 
+    // Create and register the workspace sidebar
+    let sidebar = workspace_window
+        .update(cx, |_multi_workspace, window, cx| {
+            let multi_workspace_handle = cx.entity();
+            cx.new(|cx| sidebar::Sidebar::new(multi_workspace_handle, window, cx))
+        })
+        .context("Failed to create sidebar")?;
+
+    workspace_window
+        .update(cx, |multi_workspace, _window, cx| {
+            multi_workspace.register_sidebar(sidebar.clone(), cx);
+        })
+        .context("Failed to register sidebar")?;
+
     // Open the sidebar
     workspace_window
-        .update(cx, |_multi_workspace, window, cx| {
-            window.dispatch_action(workspace::ToggleWorkspaceSidebar.boxed_clone(), cx);
+        .update(cx, |multi_workspace, window, cx| {
+            multi_workspace.toggle_sidebar(window, cx);
         })
         .context("Failed to toggle sidebar")?;
 

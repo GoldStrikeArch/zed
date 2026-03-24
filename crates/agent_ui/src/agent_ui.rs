@@ -23,7 +23,6 @@ mod mode_selector;
 mod model_selector;
 mod model_selector_popover;
 mod profile_selector;
-pub mod sidebar;
 mod slash_command;
 mod slash_command_picker;
 mod terminal_codegen;
@@ -34,8 +33,8 @@ mod text_thread_editor;
 mod text_thread_history;
 mod thread_history;
 mod thread_history_view;
-mod thread_metadata_store;
-mod threads_archive_view;
+pub mod thread_metadata_store;
+pub mod threads_archive_view;
 mod ui;
 
 use std::rc::Rc;
@@ -48,7 +47,7 @@ use client::Client;
 use command_palette_hooks::CommandPaletteFilter;
 use feature_flags::{AgentV2FeatureFlag, FeatureFlagAppExt as _};
 use fs::Fs;
-use gpui::{Action, App, Context, Entity, SharedString, Window, actions};
+use gpui::{Action, App, Context, Entity, SharedString, UpdateGlobal, Window, actions};
 use language::{
     LanguageRegistry,
     language_settings::{AllLanguageSettings, EditPredictionProvider},
@@ -60,7 +59,7 @@ use project::{AgentId, DisableAiSettings};
 use prompt_store::PromptBuilder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{LanguageModelSelection, Settings as _, SettingsStore};
+use settings::{DockPosition, DockSide, LanguageModelSelection, Settings as _, SettingsStore};
 use std::any::TypeId;
 use workspace::Workspace;
 
@@ -80,6 +79,8 @@ pub use text_thread_editor::{AgentPanelDelegate, TextThreadEditor};
 pub(crate) use thread_history::ThreadHistory;
 pub(crate) use thread_history_view::*;
 use zed_actions;
+
+pub const DEFAULT_THREAD_TITLE: &str = "New Thread";
 
 actions!(
     agent,
@@ -195,6 +196,29 @@ pub struct AuthorizeToolCall {
     pub option_kind: String,
 }
 
+/// Action to select a permission granularity option from the dropdown.
+/// This updates the selected granularity without triggering authorization.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct SelectPermissionGranularity {
+    /// The tool call ID for which to select the granularity.
+    pub tool_call_id: String,
+    /// The index of the selected granularity option.
+    pub index: usize,
+}
+
+/// Action to toggle a command pattern checkbox in the permission dropdown.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleCommandPattern {
+    /// The tool call ID for which to toggle the pattern.
+    pub tool_call_id: String,
+    /// The index of the command pattern to toggle.
+    pub pattern_index: usize,
+}
+
 /// Creates a new conversation thread, optionally based on an existing thread.
 #[derive(Default, Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = agent)]
@@ -218,7 +242,7 @@ pub struct NewNativeAgentThreadFromSummary {
 }
 
 // TODO unify this with AgentType
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Agent {
     NativeAgent,
@@ -228,66 +252,14 @@ pub enum Agent {
     },
 }
 
-// Custom impl handles legacy variant names from before the built-in agents were moved to
-// the registry: "claude_code" -> Custom { name: "claude-acp" }, "codex" -> Custom { name:
-// "codex-acp" }, "gemini" -> Custom { name: "gemini" }.
-// Can be removed at some point in the future and go back to #[derive(Deserialize)].
-impl<'de> serde::Deserialize<'de> for Agent {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use project::agent_server_store::{CLAUDE_AGENT_ID, CODEX_ID, GEMINI_ID};
-
-        let value = serde_json::Value::deserialize(deserializer)?;
-
-        if let Some(s) = value.as_str() {
-            return match s {
-                "native_agent" => Ok(Self::NativeAgent),
-                "claude_code" | "claude_agent" => Ok(Self::Custom {
-                    id: CLAUDE_AGENT_ID.into(),
-                }),
-                "codex" => Ok(Self::Custom {
-                    id: CODEX_ID.into(),
-                }),
-                "gemini" => Ok(Self::Custom {
-                    id: GEMINI_ID.into(),
-                }),
-                other => Err(serde::de::Error::unknown_variant(
-                    other,
-                    &[
-                        "native_agent",
-                        "custom",
-                        "claude_agent",
-                        "claude_code",
-                        "codex",
-                        "gemini",
-                    ],
-                )),
-            };
-        }
-
-        if let Some(obj) = value.as_object() {
-            if let Some(inner) = obj.get("custom") {
-                #[derive(serde::Deserialize)]
-                struct CustomFields {
-                    name: SharedString,
-                }
-                let fields: CustomFields =
-                    serde_json::from_value(inner.clone()).map_err(serde::de::Error::custom)?;
-                return Ok(Self::Custom {
-                    id: AgentId::new(fields.name),
-                });
-            }
-        }
-
-        Err(serde::de::Error::custom(
-            "expected a string variant or {\"custom\": {\"name\": ...}}",
-        ))
-    }
-}
-
 impl Agent {
+    pub fn id(&self) -> AgentId {
+        match self {
+            Self::NativeAgent => agent::ZED_AGENT_ID.clone(),
+            Self::Custom { id } => id.clone(),
+        }
+    }
+
     pub fn server(
         &self,
         fs: Arc<dyn fs::Fs>,
@@ -441,6 +413,31 @@ pub fn init(
 
     cx.on_flags_ready(|_, cx| {
         update_command_palette_filter(cx);
+    })
+    .detach();
+
+    cx.observe_flag::<AgentV2FeatureFlag, _>(|is_enabled, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_default_settings(cx, |defaults| {
+                if is_enabled {
+                    defaults.agent.get_or_insert_default().dock = Some(DockPosition::Left);
+                    defaults.project_panel.get_or_insert_default().dock = Some(DockSide::Right);
+                    defaults.outline_panel.get_or_insert_default().dock = Some(DockSide::Right);
+                    defaults.collaboration_panel.get_or_insert_default().dock =
+                        Some(DockPosition::Right);
+                    defaults.git_panel.get_or_insert_default().dock = Some(DockPosition::Right);
+                    defaults.notification_panel.get_or_insert_default().button = Some(false);
+                } else {
+                    defaults.agent.get_or_insert_default().dock = Some(DockPosition::Right);
+                    defaults.project_panel.get_or_insert_default().dock = Some(DockSide::Left);
+                    defaults.outline_panel.get_or_insert_default().dock = Some(DockSide::Left);
+                    defaults.collaboration_panel.get_or_insert_default().dock =
+                        Some(DockPosition::Left);
+                    defaults.git_panel.get_or_insert_default().dock = Some(DockPosition::Left);
+                    defaults.notification_panel.get_or_insert_default().button = Some(true);
+                }
+            });
+        });
     })
     .detach();
 }
@@ -759,31 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_legacy_external_agent_variants() {
-        use project::agent_server_store::{CLAUDE_AGENT_ID, CODEX_ID, GEMINI_ID};
-
-        assert_eq!(
-            serde_json::from_str::<Agent>(r#""claude_code""#).unwrap(),
-            Agent::Custom {
-                id: CLAUDE_AGENT_ID.into(),
-            },
-        );
-        assert_eq!(
-            serde_json::from_str::<Agent>(r#""codex""#).unwrap(),
-            Agent::Custom {
-                id: CODEX_ID.into(),
-            },
-        );
-        assert_eq!(
-            serde_json::from_str::<Agent>(r#""gemini""#).unwrap(),
-            Agent::Custom {
-                id: GEMINI_ID.into(),
-            },
-        );
-    }
-
-    #[test]
-    fn test_deserialize_current_external_agent_variants() {
+    fn test_deserialize_external_agent_variants() {
         assert_eq!(
             serde_json::from_str::<Agent>(r#""native_agent""#).unwrap(),
             Agent::NativeAgent,

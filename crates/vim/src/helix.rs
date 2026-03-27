@@ -1806,10 +1806,8 @@ mod test {
         })
     }
 
-    fn jump_to_word(cx: &mut VimTestContext, target_word: &str) {
-        cx.simulate_keystrokes("g w");
-
-        let label = active_helix_jump_labels(cx)
+    fn helix_jump_label_for_word(cx: &mut VimTestContext, target_word: &str) -> String {
+        active_helix_jump_labels(cx)
             .into_iter()
             .find_map(|(label, word)| (word == target_word).then_some(label))
             .unwrap_or_else(|| {
@@ -1820,7 +1818,13 @@ mod test {
                     "expected jump label for word {target_word:?}, available labels: {labels:?}"
                 );
                 panic!("{message}");
-            });
+            })
+    }
+
+    fn jump_to_word(cx: &mut VimTestContext, target_word: &str) {
+        cx.simulate_keystrokes("g w");
+
+        let label = helix_jump_label_for_word(cx, target_word);
 
         let mut chars = label.chars();
         let first = chars.next().expect("jump labels are two characters long");
@@ -1843,6 +1847,15 @@ mod test {
                 .count();
             (highlight_count, block_count)
         })
+    }
+
+    fn assert_helix_jump_cleared(cx: &mut VimTestContext, expected_overlay_counts: (usize, usize)) {
+        assert_eq!(cx.active_operator(), None);
+        assert_eq!(
+            active_helix_jump_overlay_counts(cx),
+            expected_overlay_counts,
+            "expected Helix jump UI to be fully cleared"
+        );
     }
 
     fn helix_jump_labels_for_full_buffer(cx: &mut VimTestContext) -> Vec<(String, String)> {
@@ -3195,6 +3208,48 @@ mod test {
     }
 
     #[gpui::test]
+    async fn test_helix_jump_cancels_on_escape(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("ˇhello world\njump labels", Mode::HelixNormal);
+        let overlay_counts = active_helix_jump_overlay_counts(&mut cx);
+
+        cx.simulate_keystrokes("g w");
+        cx.simulate_keystrokes("escape");
+
+        cx.assert_state("ˇhello world\njump labels", Mode::HelixNormal);
+        assert_helix_jump_cleared(&mut cx, overlay_counts);
+    }
+
+    #[gpui::test]
+    async fn test_helix_jump_cancels_on_invalid_first_char(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("ˇalpha beta gamma", Mode::HelixNormal);
+        let overlay_counts = active_helix_jump_overlay_counts(&mut cx);
+
+        cx.simulate_keystrokes("g w");
+        cx.simulate_keystrokes("z");
+
+        cx.assert_state("ˇalpha beta gamma", Mode::HelixNormal);
+        assert_helix_jump_cleared(&mut cx, overlay_counts);
+    }
+
+    #[gpui::test]
+    async fn test_helix_jump_cancels_on_invalid_second_char(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("ˇalpha beta gamma", Mode::HelixNormal);
+        let overlay_counts = active_helix_jump_overlay_counts(&mut cx);
+
+        cx.simulate_keystrokes("g w");
+        cx.simulate_keystrokes("a z");
+
+        cx.assert_state("ˇalpha beta gamma", Mode::HelixNormal);
+        assert_helix_jump_cleared(&mut cx, overlay_counts);
+    }
+
+    #[gpui::test]
     async fn test_helix_jump_keeps_full_overlay_after_first_key(cx: &mut gpui::TestAppContext) {
         let mut cx = VimTestContext::new(cx, true).await;
         cx.enable_helix();
@@ -3251,6 +3306,49 @@ mod test {
     }
 
     #[gpui::test]
+    async fn test_helix_jump_skips_single_char_words(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("ˇa bb c dd e", Mode::HelixNormal);
+
+        let words = helix_jump_labels_for_full_buffer(&mut cx)
+            .into_iter()
+            .map(|(_, word)| word)
+            .collect::<Vec<_>>();
+
+        assert_eq!(words, vec!["bb".to_string(), "dd".to_string()]);
+    }
+
+    #[gpui::test]
+    async fn test_helix_jump_handles_underscored_words(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("baz quxˇ foo_bar _private", Mode::HelixNormal);
+
+        let words = helix_jump_labels_for_full_buffer(&mut cx)
+            .into_iter()
+            .map(|(_, word)| word)
+            .collect::<Vec<_>>();
+
+        assert!(words.iter().any(|word| word == "foo_bar"));
+        assert!(words.iter().any(|word| word == "_private"));
+        assert!(!words.iter().any(|word| word == "foo"));
+        assert!(!words.iter().any(|word| word == "bar"));
+    }
+
+    #[gpui::test]
+    async fn test_helix_jump_at_end_of_buffer(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("alpha beta gammaˇ", Mode::HelixNormal);
+
+        jump_to_word(&mut cx, "gamma");
+
+        cx.assert_state("alpha beta «gammaˇ»", Mode::HelixNormal);
+        assert_eq!(cx.active_operator(), None);
+    }
+
+    #[gpui::test]
     async fn test_helix_jump_moves_to_target_word(cx: &mut gpui::TestAppContext) {
         let mut cx = VimTestContext::new(cx, true).await;
         cx.enable_helix();
@@ -3271,6 +3369,20 @@ mod test {
         jump_to_word(&mut cx, "four");
 
         cx.assert_state("one «two three fourˇ»", Mode::HelixSelect);
+        assert_eq!(cx.active_operator(), None);
+    }
+
+    #[gpui::test]
+    async fn test_helix_jump_extends_selection_backward_from_forward_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("one «twoˇ» three four", Mode::HelixSelect);
+
+        jump_to_word(&mut cx, "one");
+
+        cx.assert_state("«ˇone two» three four", Mode::HelixSelect);
         assert_eq!(cx.active_operator(), None);
     }
 
@@ -3320,6 +3432,66 @@ mod test {
             !labels.iter().any(|(_, word)| word == &early_word),
             "expected distant early target {early_word:?} to be truncated first"
         );
+    }
+
+    #[gpui::test]
+    async fn test_helix_jump_label_ordering_alternates_directions(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("aaa bbb ccc ˇddd eee fff ggg", Mode::HelixNormal);
+
+        let first_labels = helix_jump_labels_for_full_buffer(&mut cx)
+            .into_iter()
+            .take(6)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            first_labels,
+            vec![
+                ("aa".to_string(), "eee".to_string()),
+                ("ab".to_string(), "ccc".to_string()),
+                ("ac".to_string(), "fff".to_string()),
+                ("ad".to_string(), "bbb".to_string()),
+                ("ae".to_string(), "ggg".to_string()),
+                ("af".to_string(), "aaa".to_string()),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_helix_jump_input_is_case_insensitive(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("ˇone two three", Mode::HelixNormal);
+
+        cx.simulate_keystrokes("g w");
+        let label = helix_jump_label_for_word(&mut cx, "three");
+        let mut chars = label.chars();
+        let first = chars
+            .next()
+            .expect("jump labels are two characters long")
+            .to_ascii_uppercase();
+        let second = chars
+            .next()
+            .expect("jump labels are two characters long")
+            .to_ascii_uppercase();
+
+        cx.simulate_keystrokes(&format!("{first} {second}"));
+
+        cx.assert_state("one two «threeˇ»", Mode::HelixNormal);
+        assert_eq!(cx.active_operator(), None);
+    }
+
+    #[gpui::test]
+    async fn test_helix_jump_with_unicode_words(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("ˇcafé résumé naïve", Mode::HelixNormal);
+
+        jump_to_word(&mut cx, "naïve");
+
+        cx.assert_state("café résumé «naïveˇ»", Mode::HelixNormal);
+        assert_eq!(cx.active_operator(), None);
     }
 
     #[gpui::test]

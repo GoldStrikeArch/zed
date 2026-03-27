@@ -1446,7 +1446,9 @@ impl Vim {
             );
         }
 
-        let hidden_width = hidden_prefix.measured_width(width_of);
+        // Jump candidates always contain at least two word characters, and the initial
+        // scan above always measures through that second character before we read the width.
+        let hidden_width = hidden_prefix.hidden_width;
 
         let left_shift = if label_width > hidden_width {
             (label_width - hidden_width).min(fit_budget.max_left_shift)
@@ -1691,14 +1693,6 @@ impl HiddenPrefixFitState {
 
     fn needs_more_width(&self, label_width: Pixels, max_left_shift: Pixels) -> bool {
         (self.hidden_width + max_left_shift) / label_width < HELIX_JUMP_MIN_LABEL_SCALE
-    }
-
-    fn measured_width<F: Fn(&str) -> Pixels>(&self, width_of: &F) -> Pixels {
-        if self.hidden_width > px(0.0) || self.text.is_empty() {
-            self.hidden_width
-        } else {
-            width_of(&self.text)
-        }
     }
 
     fn extend_to_fit<F: Fn(&str) -> Pixels>(

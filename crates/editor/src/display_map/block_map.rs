@@ -203,40 +203,41 @@ impl BlockPlacement<Anchor> {
     #[ztracing::instrument(skip_all)]
     fn to_wrap_row(&self, wrap_snapshot: &WrapSnapshot) -> Option<BlockPlacement<WrapRow>> {
         let buffer_snapshot = wrap_snapshot.buffer_snapshot();
+        let wrap_row_for_point =
+            |point: Point| wrap_snapshot.make_wrap_point(point, Bias::Left).row();
+        let wrap_row_for_exact_position =
+            |position: &Anchor| wrap_row_for_point(position.to_point(buffer_snapshot));
+        let wrap_row_for_line_start = |position: &Anchor| {
+            let mut point = position.to_point(buffer_snapshot);
+            point.column = 0;
+            wrap_row_for_point(point)
+        };
+        let wrap_row_for_line_end = |position: &Anchor| {
+            let mut point = position.to_point(buffer_snapshot);
+            point.column = buffer_snapshot.line_len(MultiBufferRow(point.row));
+            wrap_row_for_point(point)
+        };
         match self {
             BlockPlacement::Above(position) => {
-                let mut position = position.to_point(buffer_snapshot);
-                position.column = 0;
-                let wrap_row = wrap_snapshot.make_wrap_point(position, Bias::Left).row();
-                Some(BlockPlacement::Above(wrap_row))
+                Some(BlockPlacement::Above(wrap_row_for_line_start(position)))
             }
             BlockPlacement::Near(position) => {
-                let mut position = position.to_point(buffer_snapshot);
-                position.column = buffer_snapshot.line_len(MultiBufferRow(position.row));
-                let wrap_row = wrap_snapshot.make_wrap_point(position, Bias::Left).row();
-                Some(BlockPlacement::Near(wrap_row))
+                Some(BlockPlacement::Near(wrap_row_for_line_end(position)))
             }
-            BlockPlacement::Inline(position) => {
-                let position = position.to_point(buffer_snapshot);
-                let wrap_row = wrap_snapshot.make_wrap_point(position, Bias::Left).row();
-                Some(BlockPlacement::Inline(wrap_row))
-            }
+            BlockPlacement::Inline(position) => Some(BlockPlacement::Inline(
+                wrap_row_for_exact_position(position),
+            )),
             BlockPlacement::Below(position) => {
-                let mut position = position.to_point(buffer_snapshot);
-                position.column = buffer_snapshot.line_len(MultiBufferRow(position.row));
-                let wrap_row = wrap_snapshot.make_wrap_point(position, Bias::Left).row();
-                Some(BlockPlacement::Below(wrap_row))
+                Some(BlockPlacement::Below(wrap_row_for_line_end(position)))
             }
             BlockPlacement::Replace(range) => {
-                let mut start = range.start().to_point(buffer_snapshot);
-                let mut end = range.end().to_point(buffer_snapshot);
+                let start = range.start().to_point(buffer_snapshot);
+                let end = range.end().to_point(buffer_snapshot);
                 if start == end {
                     None
                 } else {
-                    start.column = 0;
-                    let start_wrap_row = wrap_snapshot.make_wrap_point(start, Bias::Left).row();
-                    end.column = buffer_snapshot.line_len(MultiBufferRow(end.row));
-                    let end_wrap_row = wrap_snapshot.make_wrap_point(end, Bias::Left).row();
+                    let start_wrap_row = wrap_row_for_line_start(range.start());
+                    let end_wrap_row = wrap_row_for_line_end(range.end());
                     Some(BlockPlacement::Replace(start_wrap_row..=end_wrap_row))
                 }
             }
@@ -427,19 +428,12 @@ impl Block {
         }
     }
 
-    pub fn place_near(&self) -> bool {
+    pub fn is_near_or_inline(&self) -> bool {
         match self {
-            Block::Custom(block) => matches!(block.placement, BlockPlacement::Near(_)),
-            Block::FoldedBuffer { .. } => false,
-            Block::ExcerptBoundary { .. } => false,
-            Block::BufferHeader { .. } => false,
-            Block::Spacer { .. } => false,
-        }
-    }
-
-    pub fn is_inline(&self) -> bool {
-        match self {
-            Block::Custom(block) => matches!(block.placement, BlockPlacement::Inline(_)),
+            Block::Custom(block) => matches!(
+                block.placement,
+                BlockPlacement::Near(_) | BlockPlacement::Inline(_)
+            ),
             Block::FoldedBuffer { .. } => false,
             Block::ExcerptBoundary { .. } => false,
             Block::BufferHeader { .. } => false,

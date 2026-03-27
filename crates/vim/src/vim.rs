@@ -520,7 +520,7 @@ pub(crate) struct Vim {
     selected_register: Option<char>,
     pub search: SearchState,
 
-    helix_jump_ui: Option<HelixJumpUi>,
+    helix_jump_ui: Option<HashSet<CustomBlockId>>,
 
     editor: WeakEntity<Editor>,
 
@@ -536,11 +536,6 @@ impl Render for Vim {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         gpui::Empty
     }
-}
-
-#[derive(Default)]
-struct HelixJumpUi {
-    block_ids: Vec<CustomBlockId>,
 }
 
 enum VimEvent {
@@ -1752,14 +1747,11 @@ impl Vim {
     }
 
     fn clear_helix_jump_ui(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let state = self.helix_jump_ui.take();
+        let block_ids = self.helix_jump_ui.take();
         self.update_editor(cx, move |_, editor, cx| {
             editor.clear_highlights(HighlightKey::VimHelixJump, cx);
-            if let Some(state) = state {
-                if !state.block_ids.is_empty() {
-                    let block_ids: HashSet<_> = state.block_ids.into_iter().collect();
-                    editor.remove_blocks(block_ids, None, cx);
-                }
+            if let Some(block_ids) = block_ids {
+                editor.remove_blocks(block_ids, None, cx);
             }
         });
     }
@@ -1792,7 +1784,7 @@ impl Vim {
         }) else {
             return false;
         };
-        self.helix_jump_ui = Some(HelixJumpUi { block_ids });
+        self.helix_jump_ui = (!block_ids.is_empty()).then(|| block_ids.into_iter().collect());
         true
     }
 

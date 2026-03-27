@@ -3894,7 +3894,7 @@ impl EditorElement {
             Block::Custom(custom) => {
                 let block_start = custom.start().to_point(&snapshot.buffer_snapshot());
                 let block_end = custom.end().to_point(&snapshot.buffer_snapshot());
-                if (block.place_near() || block.is_inline())
+                if block.is_near_or_inline()
                     && snapshot.is_line_folded(MultiBufferRow(block_start.row))
                 {
                     return None;
@@ -4090,7 +4090,7 @@ impl EditorElement {
         if let BlockId::Custom(custom_block_id) = block_id
             && block.has_height()
         {
-            if (block.place_near() || block.is_inline())
+            if block.is_near_or_inline()
                 && let Some((x_target, line_width)) = x_position
             {
                 let margin = em_width * 2;
@@ -4311,7 +4311,7 @@ impl EditorElement {
 
         for (row, block) in non_fixed_blocks {
             let style = block.style();
-            let width = match (style, block.place_near() || block.is_inline()) {
+            let width = match (style, block.is_near_or_inline()) {
                 (_, true) => AvailableSpace::MinContent,
                 (BlockStyle::Sticky, _) => hitbox.size.width.into(),
                 (BlockStyle::Flex, _) => hitbox
@@ -4370,8 +4370,7 @@ impl EditorElement {
                     element,
                     available_space: size(width, element_size.height.into()),
                     style,
-                    overlaps_gutter: !(block.place_near() || block.is_inline())
-                        && style != BlockStyle::Spacer,
+                    overlaps_gutter: !block.is_near_or_inline() && style != BlockStyle::Spacer,
                     is_buffer_header: block.is_buffer_header(),
                 };
                 if style == BlockStyle::Spacer {

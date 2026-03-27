@@ -1592,11 +1592,11 @@ impl Vim {
         skip_points: &[MultiBufferOffset],
         skip_ranges: &[Range<MultiBufferOffset>],
     ) -> bool {
-        // Use inclusive end (<=) so cursor at last char of word skips that word
+        // word_end is exclusive, so points at the following delimiter should not skip the word.
         skip_points
             .iter()
             .copied()
-            .any(|offset| offset >= word_start && offset <= word_end)
+            .any(|offset| offset >= word_start && offset < word_end)
             || skip_ranges
                 .iter()
                 .any(|range| range.start < word_end && word_start < range.end)
@@ -1674,6 +1674,9 @@ struct HelixJumpUiData {
 
 #[cfg(test)]
 mod test {
+    use std::fmt::Write;
+
+    use editor::HighlightKey;
     use gpui::{KeyBinding, UpdateGlobal, VisualTestContext};
     use indoc::indoc;
     use project::FakeFs;
@@ -1688,6 +1691,76 @@ mod test {
         state::{Mode, Operator},
         test::VimTestContext,
     };
+
+    fn active_helix_jump_labels(cx: &mut VimTestContext) -> Vec<(String, String)> {
+        cx.update_editor(|editor, window, cx| {
+            let labels = match editor
+                .addon::<VimAddon>()
+                .unwrap()
+                .entity
+                .read(cx)
+                .operator_stack
+                .last()
+                .cloned()
+            {
+                Some(Operator::HelixJump { labels, .. }) => labels,
+                other => panic!("expected active HelixJump operator, got {other:?}"),
+            };
+
+            let snapshot = editor.snapshot(window, cx);
+            let buffer_snapshot = snapshot.display_snapshot.buffer_snapshot();
+
+            labels
+                .into_iter()
+                .map(|label| {
+                    let jump_label = label.label.iter().collect::<String>();
+                    let word = buffer_snapshot
+                        .text_for_range(label.range.clone())
+                        .collect::<String>();
+                    (jump_label, word)
+                })
+                .collect()
+        })
+    }
+
+    fn jump_to_word(cx: &mut VimTestContext, target_word: &str) {
+        cx.simulate_keystrokes("g w");
+
+        let label = active_helix_jump_labels(cx)
+            .into_iter()
+            .find_map(|(label, word)| (word == target_word).then_some(label))
+            .unwrap_or_else(|| {
+                let mut message = String::new();
+                let labels = active_helix_jump_labels(cx);
+                let _ = write!(
+                    &mut message,
+                    "expected jump label for word {target_word:?}, available labels: {labels:?}"
+                );
+                panic!("{message}");
+            });
+
+        let mut chars = label.chars();
+        let first = chars.next().expect("jump labels are two characters long");
+        let second = chars.next().expect("jump labels are two characters long");
+        cx.simulate_keystrokes(&format!("{first} {second}"));
+    }
+
+    fn active_helix_jump_overlay_counts(cx: &mut VimTestContext) -> (usize, usize) {
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let highlight_count = snapshot
+                .text_highlight_ranges(HighlightKey::VimHelixJump)
+                .map(|ranges| ranges.as_ref().clone().1.len())
+                .unwrap_or_default();
+            let max_row = snapshot.max_point().row().0.saturating_add(1);
+            let block_count = snapshot
+                .blocks_in_range(
+                    editor::display_map::DisplayRow(0)..editor::display_map::DisplayRow(max_row),
+                )
+                .count();
+            (highlight_count, block_count)
+        })
+    }
 
     #[gpui::test]
     async fn test_word_motions(cx: &mut gpui::TestAppContext) {
@@ -2996,6 +3069,98 @@ mod test {
             matches!(cx.active_operator(), Some(Operator::HelixJump { .. })),
             "expected HelixJump operator to be active"
         )
+    }
+
+    #[gpui::test]
+    async fn test_helix_jump_keeps_full_overlay_after_first_key(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        let text = format!(
+            "ˇ{}",
+            (0..28)
+                .map(|index| format!("w{index:02}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        cx.set_state(&text, Mode::HelixNormal);
+
+        cx.simulate_keystrokes("g w");
+        let labels = active_helix_jump_labels(&mut cx);
+        let initial_overlay_counts = active_helix_jump_overlay_counts(&mut cx);
+        let first_group = labels
+            .first()
+            .and_then(|(label, _)| label.chars().next())
+            .expect("expected at least one helix jump label");
+        let next_group = labels
+            .iter()
+            .filter_map(|(label, _)| label.chars().next())
+            .find(|ch| *ch != first_group)
+            .expect("expected labels spanning more than one first-character group");
+
+        cx.simulate_keystrokes(&next_group.to_string());
+
+        assert_eq!(
+            active_helix_jump_overlay_counts(&mut cx),
+            initial_overlay_counts
+        );
+        assert!(
+            matches!(
+                cx.active_operator(),
+                Some(Operator::HelixJump {
+                    first_char: Some(ch),
+                    ..
+                }) if ch == next_group
+            ),
+            "expected HelixJump operator to keep the first typed label character"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_helix_jump_includes_word_before_cursor_boundary(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("oneˇ two three", Mode::HelixNormal);
+
+        jump_to_word(&mut cx, "one");
+
+        cx.assert_state("«oneˇ» two three", Mode::HelixNormal);
+        assert_eq!(cx.active_operator(), None);
+    }
+
+    #[gpui::test]
+    async fn test_helix_jump_moves_to_target_word(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("ˇone two three", Mode::HelixNormal);
+
+        jump_to_word(&mut cx, "three");
+
+        cx.assert_state("one two «threeˇ»", Mode::HelixNormal);
+        assert_eq!(cx.active_operator(), None);
+    }
+
+    #[gpui::test]
+    async fn test_helix_jump_extends_selection_forward(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("one «twoˇ» three four", Mode::HelixSelect);
+
+        jump_to_word(&mut cx, "four");
+
+        cx.assert_state("one «two three fourˇ»", Mode::HelixSelect);
+        assert_eq!(cx.active_operator(), None);
+    }
+
+    #[gpui::test]
+    async fn test_helix_jump_extends_reversed_selection_backward(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+        cx.set_state("one two «ˇthree» four", Mode::HelixSelect);
+
+        jump_to_word(&mut cx, "one");
+
+        cx.assert_state("«ˇone two three» four", Mode::HelixSelect);
+        assert_eq!(cx.active_operator(), None);
     }
 
     #[gpui::test]

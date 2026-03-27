@@ -1410,64 +1410,46 @@ impl Vim {
         label_width: Pixels,
         width_of: &F,
     ) -> JumpLabelFit {
-        let max_left_shift = Self::max_jump_label_left_shift(buffer, candidate, width_of);
-        let (allowed_ws_end_offset, is_end_of_line) =
-            Self::jump_label_trailing_whitespace(buffer, candidate, end_offset);
+        let fit_budget = Self::jump_label_fit_budget(buffer, candidate, end_offset, width_of);
 
-        let mut hidden_prefix = String::new();
-        let mut hide_end_offset = candidate.first_two_end;
-        let mut hidden_width = px(0.0);
-        let mut total_char_count = 0usize;
-        let mut word_char_count = 0usize;
-        let min_label_scale = if is_end_of_line {
+        let mut hidden_prefix = HiddenPrefixFitState::new(candidate.first_two_end);
+        let min_label_scale = if fit_budget.preserve_full_scale {
             1.0
         } else {
             HELIX_JUMP_MIN_LABEL_SCALE
         };
 
-        Self::scan_hidden_prefix(
+        hidden_prefix.extend_to_fit(
             buffer,
             candidate.word_start,
             candidate.word_end,
             candidate.word_end,
             label_width,
-            max_left_shift,
+            fit_budget.max_left_shift,
             min_label_scale,
             width_of,
-            &mut hidden_prefix,
-            &mut hide_end_offset,
-            &mut hidden_width,
-            &mut total_char_count,
-            &mut word_char_count,
         );
 
         if label_width > px(0.0)
-            && (hidden_width + max_left_shift) / label_width < HELIX_JUMP_MIN_LABEL_SCALE
-            && allowed_ws_end_offset > candidate.word_end
+            && hidden_prefix.needs_more_width(label_width, fit_budget.max_left_shift)
+            && fit_budget.allowed_trailing_hide_end > candidate.word_end
         {
-            Self::scan_hidden_prefix(
+            hidden_prefix.extend_to_fit(
                 buffer,
                 candidate.word_end,
-                allowed_ws_end_offset,
+                fit_budget.allowed_trailing_hide_end,
                 candidate.word_end,
                 label_width,
-                max_left_shift,
+                fit_budget.max_left_shift,
                 min_label_scale,
                 width_of,
-                &mut hidden_prefix,
-                &mut hide_end_offset,
-                &mut hidden_width,
-                &mut total_char_count,
-                &mut word_char_count,
             );
         }
 
-        if hidden_width <= px(0.0) {
-            hidden_width = width_of(&hidden_prefix);
-        }
+        let hidden_width = hidden_prefix.measured_width(width_of);
 
         let left_shift = if label_width > hidden_width {
-            (label_width - hidden_width).min(max_left_shift)
+            (label_width - hidden_width).min(fit_budget.max_left_shift)
         } else {
             px(0.0)
         };
@@ -1480,17 +1462,22 @@ impl Vim {
         };
 
         JumpLabelFit {
-            hide_end_offset,
+            hide_end_offset: hidden_prefix.hide_end_offset,
             left_shift,
-            scale_factor: if is_end_of_line { 1.0 } else { scale_factor },
+            scale_factor: if fit_budget.preserve_full_scale {
+                1.0
+            } else {
+                scale_factor
+            },
         }
     }
 
-    fn max_jump_label_left_shift<F: Fn(&str) -> Pixels>(
+    fn jump_label_fit_budget<F: Fn(&str) -> Pixels>(
         buffer: &MultiBufferSnapshot,
         candidate: &JumpCandidate,
+        end_offset: MultiBufferOffset,
         width_of: &F,
-    ) -> Pixels {
+    ) -> JumpLabelFitBudget {
         let mut left_ws_rev = String::new();
         let mut left_ws_count = 0usize;
         let mut left_stopped_at_line_break = false;
@@ -1528,15 +1515,9 @@ impl Vim {
         } else {
             px(2.0)
         };
-        (left_ws_width - min_left_gap).max(px(0.0))
-    }
+        let max_left_shift = (left_ws_width - min_left_gap).max(px(0.0));
 
-    fn jump_label_trailing_whitespace(
-        buffer: &MultiBufferSnapshot,
-        candidate: &JumpCandidate,
-        end_offset: MultiBufferOffset,
-    ) -> (MultiBufferOffset, bool) {
-        let mut allowed_ws_end_offset = candidate.word_end;
+        let mut allowed_trailing_hide_end = candidate.word_end;
         let mut ws_count = 0usize;
         let mut last_ws_start = candidate.word_end;
         let mut ws_end_offset = candidate.word_end;
@@ -1563,7 +1544,7 @@ impl Vim {
             ws_scan_offset += chunk.len();
         }
 
-        let is_end_of_line = hit_line_break_after_word && next_non_ws.is_none()
+        let preserve_full_scale = hit_line_break_after_word && next_non_ws.is_none()
             || matches!(
                 buffer.chars_at(candidate.word_end).next(),
                 None | Some('\n') | Some('\r')
@@ -1579,68 +1560,18 @@ impl Vim {
                 // Keep at least one whitespace character visible so adjacent labels
                 // remain visually separated.
                 if ws_count > 1 {
-                    allowed_ws_end_offset = last_ws_start;
+                    allowed_trailing_hide_end = last_ws_start;
                 }
             } else {
                 // Next token is punctuation or end-of-range — safe to hide all whitespace.
-                allowed_ws_end_offset = ws_end_offset;
+                allowed_trailing_hide_end = ws_end_offset;
             }
         }
 
-        (allowed_ws_end_offset, is_end_of_line)
-    }
-
-    fn scan_hidden_prefix<F: Fn(&str) -> Pixels>(
-        buffer: &MultiBufferSnapshot,
-        range_start: MultiBufferOffset,
-        range_end: MultiBufferOffset,
-        word_end: MultiBufferOffset,
-        label_width: Pixels,
-        max_left_shift: Pixels,
-        min_label_scale: f32,
-        width_of: &F,
-        hidden_prefix: &mut String,
-        hide_end_offset: &mut MultiBufferOffset,
-        hidden_width: &mut Pixels,
-        total_char_count: &mut usize,
-        word_char_count: &mut usize,
-    ) {
-        let mut offset = range_start;
-        for chunk in buffer.text_for_range(range_start..range_end) {
-            for (idx, ch) in chunk.char_indices() {
-                let absolute = offset + idx;
-
-                *total_char_count += 1;
-                if *total_char_count > HELIX_JUMP_MAX_HIDDEN_CHARS {
-                    return;
-                }
-
-                hidden_prefix.push(ch);
-                let end_offset = absolute + ch.len_utf8();
-
-                if absolute < word_end && is_jump_word_char(ch) {
-                    *word_char_count += 1;
-                }
-
-                if *word_char_count < 2 {
-                    continue;
-                }
-
-                *hide_end_offset = end_offset;
-                *hidden_width = width_of(hidden_prefix.as_str());
-
-                let effective_width = *hidden_width + max_left_shift;
-                let scale_needed = if label_width > px(0.0) {
-                    (effective_width / label_width).min(1.0)
-                } else {
-                    1.0
-                };
-
-                if scale_needed >= min_label_scale {
-                    return;
-                }
-            }
-            offset += chunk.len();
+        JumpLabelFitBudget {
+            max_left_shift,
+            allowed_trailing_hide_end,
+            preserve_full_scale,
         }
     }
 
@@ -1723,12 +1654,100 @@ struct JumpLabelFit {
     scale_factor: f32,
 }
 
+struct JumpLabelFitBudget {
+    max_left_shift: Pixels,
+    allowed_trailing_hide_end: MultiBufferOffset,
+    preserve_full_scale: bool,
+}
+
+struct HiddenPrefixFitState {
+    text: String,
+    hide_end_offset: MultiBufferOffset,
+    hidden_width: Pixels,
+    total_char_count: usize,
+    word_char_count: usize,
+}
+
 impl JumpLabelFit {
     fn monospace(hide_end_offset: MultiBufferOffset) -> Self {
         Self {
             hide_end_offset,
             left_shift: px(0.0),
             scale_factor: 1.0,
+        }
+    }
+}
+
+impl HiddenPrefixFitState {
+    fn new(hide_end_offset: MultiBufferOffset) -> Self {
+        Self {
+            text: String::new(),
+            hide_end_offset,
+            hidden_width: px(0.0),
+            total_char_count: 0,
+            word_char_count: 0,
+        }
+    }
+
+    fn needs_more_width(&self, label_width: Pixels, max_left_shift: Pixels) -> bool {
+        (self.hidden_width + max_left_shift) / label_width < HELIX_JUMP_MIN_LABEL_SCALE
+    }
+
+    fn measured_width<F: Fn(&str) -> Pixels>(&self, width_of: &F) -> Pixels {
+        if self.hidden_width > px(0.0) || self.text.is_empty() {
+            self.hidden_width
+        } else {
+            width_of(&self.text)
+        }
+    }
+
+    fn extend_to_fit<F: Fn(&str) -> Pixels>(
+        &mut self,
+        buffer: &MultiBufferSnapshot,
+        range_start: MultiBufferOffset,
+        range_end: MultiBufferOffset,
+        word_end: MultiBufferOffset,
+        label_width: Pixels,
+        max_left_shift: Pixels,
+        min_label_scale: f32,
+        width_of: &F,
+    ) {
+        let mut offset = range_start;
+        for chunk in buffer.text_for_range(range_start..range_end) {
+            for (idx, ch) in chunk.char_indices() {
+                let absolute = offset + idx;
+
+                self.total_char_count += 1;
+                if self.total_char_count > HELIX_JUMP_MAX_HIDDEN_CHARS {
+                    return;
+                }
+
+                self.text.push(ch);
+                let end_offset = absolute + ch.len_utf8();
+
+                if absolute < word_end && is_jump_word_char(ch) {
+                    self.word_char_count += 1;
+                }
+
+                if self.word_char_count < 2 {
+                    continue;
+                }
+
+                self.hide_end_offset = end_offset;
+                self.hidden_width = width_of(self.text.as_str());
+
+                let effective_width = self.hidden_width + max_left_shift;
+                let scale_needed = if label_width > px(0.0) {
+                    (effective_width / label_width).min(1.0)
+                } else {
+                    1.0
+                };
+
+                if scale_needed >= min_label_scale {
+                    return;
+                }
+            }
+            offset += chunk.len();
         }
     }
 }

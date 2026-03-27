@@ -54,7 +54,7 @@ use state::{
 };
 use std::{mem, ops::Range, sync::Arc};
 use surrounds::SurroundsType;
-use theme::ThemeSettings;
+use theme_settings::ThemeSettings;
 use ui::{IntoElement, SharedString, px};
 use vim_mode_setting::HelixModeSetting;
 use vim_mode_setting::VimModeSetting;

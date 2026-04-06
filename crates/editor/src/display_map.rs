@@ -145,9 +145,12 @@ pub enum FoldStatus {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum NavigationOverlayKey {
-    BeamJump,
-    HelixJump,
+pub struct NavigationOverlayKey(TypeId);
+
+impl NavigationOverlayKey {
+    pub const fn unique<T: 'static>() -> Self {
+        Self(TypeId::of::<T>())
+    }
 }
 
 /// Keys for tagging text highlights.

@@ -12779,6 +12779,14 @@ mod tests {
     use std::num::NonZeroU32;
     use util::test::sample_text;
 
+    enum PrimaryNavigationOverlay {}
+    enum SecondaryNavigationOverlay {}
+
+    const PRIMARY_NAVIGATION_OVERLAY_KEY: NavigationOverlayKey =
+        NavigationOverlayKey::unique::<PrimaryNavigationOverlay>();
+    const SECONDARY_NAVIGATION_OVERLAY_KEY: NavigationOverlayKey =
+        NavigationOverlayKey::unique::<SecondaryNavigationOverlay>();
+
     fn navigation_target_layouts(state: &EditorLayout) -> Vec<&NavigationTargetLayout> {
         state
             .navigation_overlay_paint_commands
@@ -12880,7 +12888,7 @@ mod tests {
             let fade_end = buffer_snapshot.anchor_after(Point::new(0, 2));
 
             editor.set_navigation_overlays(
-                NavigationOverlayKey::HelixJump,
+                PRIMARY_NAVIGATION_OVERLAY_KEY,
                 vec![NavigationTargetOverlay {
                     priority: 0,
                     target_range: target_start..target_end,
@@ -12893,14 +12901,14 @@ mod tests {
             assert!(
                 editor
                     .text_highlights(
-                        HighlightKey::NavigationOverlay(NavigationOverlayKey::HelixJump),
+                        HighlightKey::NavigationOverlay(PRIMARY_NAVIGATION_OVERLAY_KEY),
                         cx,
                     )
                     .is_some()
             );
 
             editor.set_navigation_overlays(
-                NavigationOverlayKey::HelixJump,
+                PRIMARY_NAVIGATION_OVERLAY_KEY,
                 vec![NavigationTargetOverlay {
                     priority: 0,
                     target_range: target_start..target_end,
@@ -12913,7 +12921,7 @@ mod tests {
             assert!(
                 editor
                     .text_highlights(
-                        HighlightKey::NavigationOverlay(NavigationOverlayKey::HelixJump),
+                        HighlightKey::NavigationOverlay(PRIMARY_NAVIGATION_OVERLAY_KEY),
                         cx,
                     )
                     .is_none()
@@ -12944,7 +12952,7 @@ mod tests {
             let second_fade_end = buffer_snapshot.anchor_after(Point::new(0, 2));
 
             editor.set_navigation_overlays(
-                NavigationOverlayKey::HelixJump,
+                PRIMARY_NAVIGATION_OVERLAY_KEY,
                 vec![
                     NavigationTargetOverlay {
                         priority: 0,
@@ -12966,7 +12974,7 @@ mod tests {
 
             let (_, fade_ranges) = editor
                 .text_highlights(
-                    HighlightKey::NavigationOverlay(NavigationOverlayKey::HelixJump),
+                    HighlightKey::NavigationOverlay(PRIMARY_NAVIGATION_OVERLAY_KEY),
                     cx,
                 )
                 .expect("expected navigation fade highlights");
@@ -13007,7 +13015,7 @@ mod tests {
             let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
 
             editor.set_navigation_overlays(
-                NavigationOverlayKey::BeamJump,
+                SECONDARY_NAVIGATION_OVERLAY_KEY,
                 vec![NavigationTargetOverlay {
                     priority: 10,
                     target_range: buffer_snapshot.anchor_after(Point::new(0, 9))
@@ -13022,7 +13030,7 @@ mod tests {
                 cx,
             );
             editor.set_navigation_overlays(
-                NavigationOverlayKey::HelixJump,
+                PRIMARY_NAVIGATION_OVERLAY_KEY,
                 vec![NavigationTargetOverlay {
                     priority: 1,
                     target_range: buffer_snapshot.anchor_after(Point::new(0, 0))
@@ -13083,7 +13091,7 @@ mod tests {
             let second_target_end = buffer_snapshot.anchor_after(Point::new(0, 15));
 
             editor.set_navigation_overlays(
-                NavigationOverlayKey::BeamJump,
+                SECONDARY_NAVIGATION_OVERLAY_KEY,
                 vec![NavigationTargetOverlay {
                     priority: 0,
                     target_range: target_start..wrapped_target_end,
@@ -13105,7 +13113,7 @@ mod tests {
                 cx,
             );
             editor.set_navigation_overlays(
-                NavigationOverlayKey::HelixJump,
+                PRIMARY_NAVIGATION_OVERLAY_KEY,
                 vec![NavigationTargetOverlay {
                     priority: 0,
                     target_range: second_target_start..second_target_end,
@@ -13171,7 +13179,7 @@ mod tests {
             let target_end = buffer_snapshot.anchor_after(Point::new(0, 40));
 
             editor.set_navigation_overlays(
-                NavigationOverlayKey::HelixJump,
+                PRIMARY_NAVIGATION_OVERLAY_KEY,
                 vec![NavigationTargetOverlay {
                     priority: 0,
                     target_range: target_start..target_end,
@@ -13240,7 +13248,7 @@ mod tests {
             let fade_end = buffer_snapshot.anchor_after(Point::new(0, 2));
 
             editor.set_navigation_overlays(
-                NavigationOverlayKey::HelixJump,
+                PRIMARY_NAVIGATION_OVERLAY_KEY,
                 vec![NavigationTargetOverlay {
                     priority: 0,
                     target_range: target_start..target_end,
@@ -13261,7 +13269,7 @@ mod tests {
                 }],
                 cx,
             );
-            editor.clear_navigation_overlays(NavigationOverlayKey::HelixJump, cx);
+            editor.clear_navigation_overlays(PRIMARY_NAVIGATION_OVERLAY_KEY, cx);
 
             assert!(
                 editor.navigation_overlay_sets().is_empty(),
@@ -13270,7 +13278,7 @@ mod tests {
             assert!(
                 editor
                     .text_highlights(
-                        HighlightKey::NavigationOverlay(NavigationOverlayKey::HelixJump),
+                        HighlightKey::NavigationOverlay(PRIMARY_NAVIGATION_OVERLAY_KEY),
                         cx,
                     )
                     .is_none(),
@@ -13305,7 +13313,7 @@ mod tests {
             let fade_end = buffer_snapshot.anchor_after(Point::new(0, 2));
 
             editor.set_navigation_overlays(
-                NavigationOverlayKey::HelixJump,
+                PRIMARY_NAVIGATION_OVERLAY_KEY,
                 vec![NavigationTargetOverlay {
                     priority: 0,
                     target_range: target_start..target_end,
@@ -13326,7 +13334,7 @@ mod tests {
                 }],
                 cx,
             );
-            editor.set_navigation_overlays(NavigationOverlayKey::HelixJump, Vec::new(), cx);
+            editor.set_navigation_overlays(PRIMARY_NAVIGATION_OVERLAY_KEY, Vec::new(), cx);
 
             assert!(
                 editor.navigation_overlay_sets().is_empty(),
@@ -13335,7 +13343,7 @@ mod tests {
             assert!(
                 editor
                     .text_highlights(
-                        HighlightKey::NavigationOverlay(NavigationOverlayKey::HelixJump),
+                        HighlightKey::NavigationOverlay(PRIMARY_NAVIGATION_OVERLAY_KEY),
                         cx,
                     )
                     .is_none(),
@@ -13372,7 +13380,7 @@ mod tests {
             let target_end = buffer_snapshot.anchor_after(Point::new(0, 40));
 
             editor.set_navigation_overlays(
-                NavigationOverlayKey::BeamJump,
+                SECONDARY_NAVIGATION_OVERLAY_KEY,
                 vec![NavigationTargetOverlay {
                     priority: 0,
                     target_range: target_start..target_end,
@@ -13426,7 +13434,7 @@ mod tests {
             let target_end = buffer_snapshot.anchor_after(Point::new(1, 6));
 
             editor.set_navigation_overlays(
-                NavigationOverlayKey::BeamJump,
+                SECONDARY_NAVIGATION_OVERLAY_KEY,
                 vec![NavigationTargetOverlay {
                     priority: 0,
                     target_range: target_start..target_end,
@@ -13479,7 +13487,7 @@ mod tests {
             let target_end = buffer_snapshot.anchor_after(Point::new(80, 5));
 
             editor.set_navigation_overlays(
-                NavigationOverlayKey::BeamJump,
+                SECONDARY_NAVIGATION_OVERLAY_KEY,
                 vec![NavigationTargetOverlay {
                     priority: 0,
                     target_range: target_start..target_end,

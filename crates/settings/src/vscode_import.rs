@@ -199,7 +199,7 @@ impl VsCodeSettings {
             log: None,
             message_editor: None,
             node: self.node_binary_settings(),
-            notification_panel: None,
+
             outline_panel: self.outline_panel_settings_content(),
             preview_tabs: self.preview_tabs_settings_content(),
             project: self.project_settings_content(),
@@ -287,6 +287,7 @@ impl VsCodeSettings {
             }),
             rounded_selection: self.read_bool("editor.roundedSelection"),
             scroll_beyond_last_line: None,
+            mouse_wheel_zoom: self.read_bool("editor.mouseWheelZoom"),
             scroll_sensitivity: self.read_f32("editor.mouseWheelScrollSensitivity"),
             scrollbar: self.scrollbar_content(),
             search: self.search_content(),
@@ -805,7 +806,19 @@ impl VsCodeSettings {
             show_diagnostics: self
                 .read_bool("problems.decorations.enabled")
                 .and_then(|b| if b { Some(ShowDiagnostics::Off) } else { None }),
-            sort_mode: None,
+            sort_mode: self.read_enum("explorer.sortOrder", |s| match s {
+                "default" | "foldersNestsFiles" => Some(ProjectPanelSortMode::DirectoriesFirst),
+                "mixed" => Some(ProjectPanelSortMode::Mixed),
+                "filesFirst" => Some(ProjectPanelSortMode::FilesFirst),
+                _ => None,
+            }),
+            sort_order: self.read_enum("explorer.sortOrderLexicographicOptions", |s| match s {
+                "default" => Some(ProjectPanelSortOrder::Default),
+                "upper" => Some(ProjectPanelSortOrder::Upper),
+                "lower" => Some(ProjectPanelSortOrder::Lower),
+                "unicode" => Some(ProjectPanelSortOrder::Unicode),
+                _ => None,
+            }),
             starts_open: None,
             sticky_scroll: None,
             auto_open: None,

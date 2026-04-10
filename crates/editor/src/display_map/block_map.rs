@@ -9,7 +9,7 @@ use crate::{
 };
 use collections::{Bound, HashMap, HashSet};
 use gpui::{AnyElement, App, EntityId, Pixels, Window};
-use language::{Patch, Point};
+use language::{LanguageAwareStyling, Patch, Point};
 use multi_buffer::{
     Anchor, ExcerptBoundaryInfo, MultiBuffer, MultiBufferOffset, MultiBufferPoint, MultiBufferRow,
     MultiBufferSnapshot, RowInfo, ToOffset, ToPoint as _,
@@ -2160,7 +2160,10 @@ impl BlockSnapshot {
     pub fn text(&self) -> String {
         self.chunks(
             BlockRow(0)..self.transforms.summary().output_rows,
-            false,
+            LanguageAwareStyling {
+                tree_sitter: false,
+                diagnostics: false,
+            },
             false,
             Highlights::default(),
         )
@@ -2172,7 +2175,7 @@ impl BlockSnapshot {
     pub(crate) fn chunks<'a>(
         &'a self,
         rows: Range<BlockRow>,
-        language_aware: bool,
+        language_aware: LanguageAwareStyling,
         masked: bool,
         highlights: Highlights<'a>,
     ) -> BlockChunks<'a> {
@@ -4320,7 +4323,10 @@ mod tests {
                 let actual_text = blocks_snapshot
                     .chunks(
                         BlockRow(start_row as u32)..BlockRow(end_row as u32),
-                        false,
+                        LanguageAwareStyling {
+                            tree_sitter: false,
+                            diagnostics: false,
+                        },
                         false,
                         Highlights::default(),
                     )

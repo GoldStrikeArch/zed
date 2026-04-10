@@ -26,7 +26,7 @@ use picker::{
 use project::{AgentId, AgentServerStore};
 use settings::Settings as _;
 use theme::ActiveTheme;
-use ui::ThreadItem;
+use ui::{AgentThreadStatus, ThreadItem};
 use ui::{
     Divider, KeyBinding, ListItem, ListItemSpacing, ListSubHeader, Tooltip, WithScrollbar,
     prelude::*, utils::platform_title_bar_height,
@@ -113,6 +113,7 @@ fn fuzzy_match_positions(query: &str, text: &str) -> Option<Vec<usize>> {
 pub enum ThreadsArchiveViewEvent {
     Close,
     Unarchive { thread: ThreadMetadata },
+    CancelRestore { session_id: acp::SessionId },
 }
 
 impl EventEmitter<ThreadsArchiveViewEvent> for ThreadsArchiveView {}
@@ -131,6 +132,7 @@ pub struct ThreadsArchiveView {
     workspace: WeakEntity<Workspace>,
     agent_connection_store: WeakEntity<AgentConnectionStore>,
     agent_server_store: WeakEntity<AgentServerStore>,
+    restoring: HashSet<acp::SessionId>,
 }
 
 impl ThreadsArchiveView {
@@ -199,6 +201,7 @@ impl ThreadsArchiveView {
             workspace,
             agent_connection_store,
             agent_server_store,
+            restoring: HashSet::default(),
         };
 
         this.update_items(cx);
@@ -213,9 +216,26 @@ impl ThreadsArchiveView {
         self.selection = None;
     }
 
+    pub fn mark_restoring(&mut self, session_id: &acp::SessionId, cx: &mut Context<Self>) {
+        self.restoring.insert(session_id.clone());
+        cx.notify();
+    }
+
+    pub fn clear_restoring(&mut self, session_id: &acp::SessionId, cx: &mut Context<Self>) {
+        self.restoring.remove(session_id);
+        cx.notify();
+    }
+
     pub fn focus_filter_editor(&self, window: &mut Window, cx: &mut App) {
         let handle = self.filter_editor.read(cx).focus_handle(cx);
         handle.focus(window, cx);
+    }
+
+    pub fn is_filter_editor_focused(&self, window: &Window, cx: &App) -> bool {
+        self.filter_editor
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
     }
 
     fn update_items(&mut self, cx: &mut Context<Self>) {
@@ -316,11 +336,16 @@ impl ThreadsArchiveView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if thread.folder_paths.is_empty() {
+        if self.restoring.contains(&thread.session_id) {
+            return;
+        }
+
+        if thread.folder_paths().is_empty() {
             self.show_project_picker_for_thread(thread, window, cx);
             return;
         }
 
+        self.mark_restoring(&thread.session_id, cx);
         self.selection = None;
         self.reset_filter_editor_text(window, cx);
         cx.emit(ThreadsArchiveViewEvent::Unarchive { thread });
@@ -346,7 +371,6 @@ impl ThreadsArchiveView {
             .map(|mw| {
                 mw.read(cx)
                     .workspaces()
-                    .iter()
                     .filter_map(|ws| ws.read(cx).database_id())
                     .collect()
             })
@@ -504,14 +528,16 @@ impl ThreadsArchiveView {
                     IconName::Sparkle
                 };
 
-                ThreadItem::new(id, thread.title.clone())
+                let is_restoring = self.restoring.contains(&thread.session_id);
+
+                let base = ThreadItem::new(id, thread.title.clone())
                     .icon(icon)
                     .when_some(icon_from_external_svg, |this, svg| {
                         this.custom_icon_from_external_svg(svg)
                     })
                     .timestamp(timestamp)
                     .highlight_positions(highlight_positions.clone())
-                    .project_paths(thread.folder_paths.paths_owned())
+                    .project_paths(thread.folder_paths().paths_owned())
                     .focused(is_focused)
                     .hovered(is_hovered)
                     .on_hover(cx.listener(move |this, is_hovered, _window, cx| {
@@ -521,8 +547,31 @@ impl ThreadsArchiveView {
                             this.hovered_index = None;
                         }
                         cx.notify();
-                    }))
-                    .action_slot(
+                    }));
+
+                if is_restoring {
+                    base.status(AgentThreadStatus::Running)
+                        .action_slot(
+                            IconButton::new("cancel-restore", IconName::Close)
+                                .style(ButtonStyle::Filled)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Cancel Restore"))
+                                .on_click({
+                                    let session_id = thread.session_id.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.clear_restoring(&session_id, cx);
+                                        cx.emit(ThreadsArchiveViewEvent::CancelRestore {
+                                            session_id: session_id.clone(),
+                                        });
+                                        cx.stop_propagation();
+                                    })
+                                }),
+                        )
+                        .tooltip(Tooltip::text("Restoring\u{2026}"))
+                        .into_any_element()
+                } else {
+                    base.action_slot(
                         IconButton::new("delete-thread", IconName::Trash)
                             .style(ButtonStyle::Filled)
                             .icon_size(IconSize::Small)
@@ -555,6 +604,7 @@ impl ThreadsArchiveView {
                         })
                     })
                     .into_any_element()
+                }
             }
         }
     }
@@ -597,6 +647,9 @@ impl ThreadsArchiveView {
                 .wait_for_connection()
         });
         cx.spawn(async move |_this, cx| {
+            crate::thread_worktree_archive::cleanup_thread_archived_worktrees(&session_id, cx)
+                .await;
+
             let state = task.await?;
             let task = cx.update(|cx| {
                 if let Some(list) = state.connection.session_list(cx) {
@@ -877,7 +930,8 @@ impl ProjectPickerDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
-        self.thread.folder_paths = paths.clone();
+        self.thread.worktree_paths =
+            super::thread_metadata_store::ThreadWorktreePaths::from_folder_paths(&paths);
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.update_working_directories(&self.thread.session_id, paths, cx);
         });
@@ -1230,6 +1284,7 @@ impl PickerDelegate for ProjectPickerDelegate {
                     },
                     match_label: HighlightedMatch::join(match_labels.into_iter().flatten(), ", "),
                     paths: Vec::new(),
+                    active: false,
                 };
 
                 Some(

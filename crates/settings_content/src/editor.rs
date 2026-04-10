@@ -89,6 +89,11 @@ pub struct EditorSettingsContent {
     /// Default: 1.0
     #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub scroll_sensitivity: Option<f32>,
+    /// Whether to zoom the editor font size with the mouse wheel
+    /// while holding the primary modifier key (Cmd on macOS, Ctrl on other platforms).
+    ///
+    /// Default: false
+    pub mouse_wheel_zoom: Option<bool>,
     /// Scroll sensitivity multiplier for fast scrolling. This multiplier is applied
     /// to both the horizontal and vertical delta values while scrolling. Fast scrolling
     /// happens when a user holds the alt or option key while scrolling.
@@ -226,6 +231,14 @@ pub struct EditorSettingsContent {
     ///
     /// Default: split
     pub diff_view_style: Option<DiffViewStyle>,
+
+    /// The minimum width (in em-widths) at which the split diff view is used.
+    /// When the editor is narrower than this, the diff view automatically
+    /// switches to unified mode and switches back when the editor is wide
+    /// enough. Set to 0 to disable automatic switching.
+    ///
+    /// Default: 100
+    pub minimum_split_diff_width: Option<f32>,
 }
 
 #[derive(

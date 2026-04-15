@@ -1418,49 +1418,17 @@ pub struct EditorSnapshot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NavigationTargetOverlay {
-    /// Higher priorities paint the whole overlay on top of lower priorities.
-    pub priority: usize,
     pub target_range: Range<Anchor>,
-    pub target_style: Option<NavigationTargetStyle>,
-    pub label: Option<NavigationOverlayLabel>,
-    pub fade_range: Option<Range<Anchor>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct NavigationTargetStyle {
-    pub shape: NavigationTargetShape,
-    pub color: Hsla,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NavigationTargetShape {
-    Fill,
-    Hollow,
+    pub label: NavigationOverlayLabel,
+    pub covered_text_range: Option<Range<Anchor>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NavigationOverlayLabel {
     pub text: SharedString,
-    pub placement: NavigationOverlayPlacement,
-    pub anchor: NavigationOverlayLabelAnchor,
     pub text_color: Hsla,
-    pub background: Option<Hsla>,
     pub x_offset: Pixels,
     pub scale_factor: f32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum NavigationOverlayLabelAnchor {
-    Explicit(Anchor),
-    TargetEnd,
-    TargetStart,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NavigationOverlayPlacement {
-    Above,
-    Below,
-    Inline,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -24369,11 +24337,11 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
-        let mut fade_ranges = overlays
+        let mut covered_text_ranges = overlays
             .iter()
-            .filter_map(|overlay| overlay.fade_range.clone())
+            .filter_map(|overlay| overlay.covered_text_range.clone())
             .collect::<Vec<_>>();
-        fade_ranges.sort_by(|left, right| {
+        covered_text_ranges.sort_by(|left, right| {
             left.start
                 .cmp(&right.start, &buffer_snapshot)
                 .then_with(|| left.end.cmp(&right.end, &buffer_snapshot))
@@ -24381,10 +24349,10 @@ impl Editor {
 
         self.display_map.update(cx, |map, cx| {
             map.clear_highlights(HighlightKey::NavigationOverlay(key));
-            if !fade_ranges.is_empty() {
+            if !covered_text_ranges.is_empty() {
                 map.highlight_text(
                     HighlightKey::NavigationOverlay(key),
-                    fade_ranges,
+                    covered_text_ranges,
                     HighlightStyle {
                         fade_out: Some(1.0),
                         ..Default::default()

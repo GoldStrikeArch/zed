@@ -12706,8 +12706,8 @@ mod tests {
         state
             .navigation_overlay_paint_commands
             .iter()
-            .filter_map(|command| match command {
-                NavigationOverlayPaintCommand::Label(label) => Some(label),
+            .map(|command| match command {
+                NavigationOverlayPaintCommand::Label(label) => label,
             })
             .collect()
     }

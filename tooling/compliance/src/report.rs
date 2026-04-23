@@ -320,8 +320,8 @@ mod tests {
 
     use crate::{
         checks::{ReviewFailure, ReviewSuccess},
-        git::{CommitDetails, CommitList},
-        github::{GithubLogin, GithubUser, PullRequestReview, ReviewState},
+        git::{AutomatedChangeKind, CommitDetails, CommitList},
+        github::{AuthorAssociation, GithubLogin, GithubUser, PullRequestReview, ReviewState},
     };
 
     use super::{Report, ReportReviewSummary};
@@ -350,6 +350,7 @@ mod tests {
             }),
             state: Some(ReviewState::Approved),
             body: None,
+            author_association: Some(AuthorAssociation::Member),
         }])
     }
 
@@ -381,9 +382,10 @@ mod tests {
         );
         report.add(
             make_commit("ddd", "Dave", "dave@test.com", "Bump Version", ""),
-            Ok(ReviewSuccess::ZedZippyCommit(GithubLogin::new(
-                "dave".to_string(),
-            ))),
+            Ok(ReviewSuccess::ZedZippyCommit(
+                AutomatedChangeKind::VersionBump,
+                GithubLogin::new("dave".to_string()),
+            )),
         );
 
         let summary = report.summary();

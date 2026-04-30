@@ -79,6 +79,153 @@ fn display_ranges(editor: &Editor, cx: &mut Context<'_, Editor>) -> Vec<Range<Di
         .display_ranges(&editor.display_snapshot(cx))
 }
 
+#[test]
+fn test_string_size_with_expanded_tabs() {
+    let nz = |val| std::num::NonZeroU32::new(val).unwrap();
+    assert_eq!(reflow::char_len_with_expanded_tabs(0, "", nz(4)), 0);
+    assert_eq!(reflow::char_len_with_expanded_tabs(0, "hello", nz(4)), 5);
+    assert_eq!(reflow::char_len_with_expanded_tabs(0, "\thello", nz(4)), 9);
+    assert_eq!(reflow::char_len_with_expanded_tabs(0, "abc\tab", nz(4)), 6);
+    assert_eq!(reflow::char_len_with_expanded_tabs(0, "hello\t", nz(4)), 8);
+    assert_eq!(reflow::char_len_with_expanded_tabs(0, "\t\t", nz(8)), 16);
+    assert_eq!(reflow::char_len_with_expanded_tabs(0, "x\t", nz(8)), 8);
+    assert_eq!(reflow::char_len_with_expanded_tabs(7, "x\t", nz(8)), 9);
+}
+
+#[test]
+fn test_word_breaking_tokenizer() {
+    let tests: &[(&str, &[reflow::WordBreakToken<'static>])] = &[
+        ("", &[]),
+        ("  ", &[whitespace("  ", 2)]),
+        ("Ʒ", &[word("Ʒ", 1)]),
+        ("Ǽ", &[word("Ǽ", 1)]),
+        ("⋑", &[word("⋑", 1)]),
+        ("⋑⋑", &[word("⋑⋑", 2)]),
+        (
+            "原理，进而",
+            &[word("原", 1), word("理，", 2), word("进", 1), word("而", 1)],
+        ),
+        (
+            "hello world",
+            &[word("hello", 5), whitespace(" ", 1), word("world", 5)],
+        ),
+        (
+            "hello, world",
+            &[word("hello,", 6), whitespace(" ", 1), word("world", 5)],
+        ),
+        (
+            "  hello world",
+            &[
+                whitespace("  ", 2),
+                word("hello", 5),
+                whitespace(" ", 1),
+                word("world", 5),
+            ],
+        ),
+        (
+            "这是什么 \n 钢笔",
+            &[
+                word("这", 1),
+                word("是", 1),
+                word("什", 1),
+                word("么", 1),
+                whitespace(" ", 1),
+                newline(),
+                whitespace(" ", 1),
+                word("钢", 1),
+                word("笔", 1),
+            ],
+        ),
+        (" mutton", &[whitespace(" ", 1), word("mutton", 6)]),
+    ];
+
+    fn word(token: &'static str, grapheme_len: usize) -> reflow::WordBreakToken<'static> {
+        reflow::WordBreakToken::Word {
+            token,
+            grapheme_len,
+        }
+    }
+
+    fn whitespace(token: &'static str, grapheme_len: usize) -> reflow::WordBreakToken<'static> {
+        reflow::WordBreakToken::InlineWhitespace {
+            token,
+            grapheme_len,
+        }
+    }
+
+    fn newline() -> reflow::WordBreakToken<'static> {
+        reflow::WordBreakToken::Newline
+    }
+
+    for (input, result) in tests {
+        assert_eq!(
+            reflow::WordBreakingTokenizer::new(input)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            *result,
+        );
+    }
+}
+
+#[test]
+fn test_wrap_with_prefix() {
+    assert_eq!(
+        reflow::wrap_with_prefix(
+            "# ".to_string(),
+            "# ".to_string(),
+            "abcdefg".to_string(),
+            4,
+            std::num::NonZeroU32::new(4).unwrap(),
+            false,
+        ),
+        "# abcdefg"
+    );
+    assert_eq!(
+        reflow::wrap_with_prefix(
+            "".to_string(),
+            "".to_string(),
+            "\thello world".to_string(),
+            8,
+            std::num::NonZeroU32::new(4).unwrap(),
+            false,
+        ),
+        "hello\nworld"
+    );
+    assert_eq!(
+        reflow::wrap_with_prefix(
+            "// ".to_string(),
+            "// ".to_string(),
+            "xx \nyy zz aa bb cc".to_string(),
+            12,
+            std::num::NonZeroU32::new(4).unwrap(),
+            false,
+        ),
+        "// xx yy zz\n// aa bb cc"
+    );
+    assert_eq!(
+        reflow::wrap_with_prefix(
+            String::new(),
+            String::new(),
+            "这是什么 \n 钢笔".to_string(),
+            3,
+            std::num::NonZeroU32::new(4).unwrap(),
+            false,
+        ),
+        "这是什\n么 钢\n笔"
+    );
+    assert_eq!(
+        reflow::wrap_with_prefix(
+            String::new(),
+            String::new(),
+            format!("foo{}bar", '\u{2009}'),
+            80,
+            std::num::NonZeroU32::new(4).unwrap(),
+            false,
+        ),
+        format!("foo{}bar", '\u{2009}')
+    );
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod property_test;
 

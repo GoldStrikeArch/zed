@@ -1932,8 +1932,18 @@ impl EditorElement {
                         }
                     }
 
+                    const SECONDARY_LOCAL_CURSOR_OPACITY: f32 = 0.45;
+                    let cursor_color = if editor.dim_secondary_local_cursors
+                        && selection.is_local
+                        && !selection.is_newest
+                    {
+                        player_color.cursor.opacity(SECONDARY_LOCAL_CURSOR_OPACITY)
+                    } else {
+                        player_color.cursor
+                    };
+
                     let mut cursor = CursorLayout {
-                        color: player_color.cursor,
+                        color: cursor_color,
                         block_width,
                         origin: point(x, y),
                         line_height,

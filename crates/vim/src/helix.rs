@@ -29,6 +29,12 @@ use crate::{
 };
 use std::ops::Range;
 
+#[derive(Clone, Copy)]
+enum HelixSelectionRotation {
+    Backward,
+    Forward,
+}
+
 actions!(
     vim,
     [
@@ -49,6 +55,12 @@ actions!(
         /// Removes all but the one selection that was created last.
         /// `Newest` can eventually be `Primary`.
         HelixKeepNewestSelection,
+        /// Removes the primary selection.
+        HelixRemovePrimarySelection,
+        /// Rotates the primary selection backward.
+        HelixRotateSelectionBackward,
+        /// Rotates the primary selection forward.
+        HelixRotateSelectionForward,
         /// Copies all selections below.
         HelixDuplicateBelow,
         /// Copies all selections above.
@@ -76,6 +88,9 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     Vim::action(editor, cx, Vim::helix_paste);
     Vim::action(editor, cx, Vim::helix_select_regex);
     Vim::action(editor, cx, Vim::helix_keep_newest_selection);
+    Vim::action(editor, cx, Vim::helix_remove_primary_selection);
+    Vim::action(editor, cx, Vim::helix_rotate_selection_backward);
+    Vim::action(editor, cx, Vim::helix_rotate_selection_forward);
     Vim::action(editor, cx, |vim, _: &HelixDuplicateBelow, window, cx| {
         let times = Vim::take_count(cx);
         vim.helix_duplicate_selections_below(times, window, cx);
@@ -854,7 +869,108 @@ impl Vim {
             let newest = editor
                 .selections
                 .newest::<MultiBufferOffset>(&editor.display_snapshot(cx));
-            editor.change_selections(Default::default(), window, cx, |s| s.select(vec![newest]));
+            editor.change_selections(Default::default(), window, cx, |s| {
+                s.select(vec![newest]);
+            });
+        });
+    }
+
+    fn helix_remove_primary_selection(
+        &mut self,
+        _: &HelixRemovePrimarySelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        Vim::take_count(cx);
+        Vim::take_forced_motion(cx);
+        self.update_editor(cx, |_, editor, cx| {
+            editor.change_selections(Default::default(), window, cx, |s| {
+                let snapshot = s.display_snapshot();
+                let primary_selection_id = s.newest_anchor().id;
+                let mut selections = s.all::<MultiBufferOffset>(&snapshot);
+                if selections.len() <= 1 {
+                    return;
+                }
+
+                let Some(primary_index) = selections
+                    .iter()
+                    .position(|selection| selection.id == primary_selection_id)
+                else {
+                    return;
+                };
+
+                selections.remove(primary_index);
+                let new_primary_index = primary_index.min(selections.len().saturating_sub(1));
+                let new_primary_id = s.new_selection_id();
+                if let Some(selection) = selections.get_mut(new_primary_index) {
+                    selection.id = new_primary_id;
+                }
+                s.select(selections);
+            });
+        });
+    }
+
+    fn helix_rotate_selection_backward(
+        &mut self,
+        _: &HelixRotateSelectionBackward,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.helix_rotate_selection(HelixSelectionRotation::Backward, window, cx);
+    }
+
+    fn helix_rotate_selection_forward(
+        &mut self,
+        _: &HelixRotateSelectionForward,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.helix_rotate_selection(HelixSelectionRotation::Forward, window, cx);
+    }
+
+    fn helix_rotate_selection(
+        &mut self,
+        rotation: HelixSelectionRotation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = Vim::take_count(cx).unwrap_or(1);
+        Vim::take_forced_motion(cx);
+        self.update_editor(cx, |_, editor, cx| {
+            editor.change_selections(Default::default(), window, cx, |s| {
+                let snapshot = s.display_snapshot();
+                let primary_selection_id = s.newest_anchor().id;
+                let mut selections = s.all::<MultiBufferOffset>(&snapshot);
+                let selection_count = selections.len();
+                if selection_count <= 1 {
+                    return;
+                }
+
+                let Some(primary_index) = selections
+                    .iter()
+                    .position(|selection| selection.id == primary_selection_id)
+                else {
+                    return;
+                };
+
+                let offset = count % selection_count;
+                let target_index = match rotation {
+                    HelixSelectionRotation::Backward => {
+                        (primary_index + selection_count - offset) % selection_count
+                    }
+                    HelixSelectionRotation::Forward => (primary_index + offset) % selection_count,
+                };
+
+                if target_index == primary_index {
+                    return;
+                }
+
+                let new_primary_id = s.new_selection_id();
+                if let Some(selection) = selections.get_mut(target_index) {
+                    selection.id = new_primary_id;
+                }
+                s.select(selections);
+            });
         });
     }
 
@@ -2984,6 +3100,52 @@ mod test {
         // cx.set_state("ˇstuff one two one", Mode::HelixNormal);
         // cx.simulate_keystrokes("s o n e enter");
         // cx.assert_state("ˇstuff one two one", Mode::HelixNormal);
+    }
+
+    #[gpui::test]
+    async fn test_helix_rotate_primary_selection(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+
+        cx.set_state("ˇone\nˇtwo\nˇthree", Mode::HelixNormal);
+        cx.simulate_keystrokes(")");
+        cx.simulate_keystrokes(",");
+        cx.assert_state("ˇone\ntwo\nthree", Mode::HelixNormal);
+
+        cx.set_state("ˇone\nˇtwo\nˇthree", Mode::HelixNormal);
+        cx.simulate_keystrokes("(");
+        cx.simulate_keystrokes(",");
+        cx.assert_state("one\nˇtwo\nthree", Mode::HelixNormal);
+
+        cx.set_state("ˇone\nˇtwo\nˇthree", Mode::HelixNormal);
+        cx.simulate_keystrokes("2 )");
+        cx.simulate_keystrokes(",");
+        cx.assert_state("one\nˇtwo\nthree", Mode::HelixNormal);
+    }
+
+    #[gpui::test]
+    async fn test_helix_remove_primary_selection(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+
+        cx.set_state("ˇone\nˇtwo\nˇthree", Mode::HelixNormal);
+        cx.simulate_keystrokes("alt-,");
+        cx.assert_state("ˇone\nˇtwo\nthree", Mode::HelixNormal);
+        cx.simulate_keystrokes(",");
+        cx.assert_state("one\nˇtwo\nthree", Mode::HelixNormal);
+    }
+
+    #[gpui::test]
+    async fn test_helix_remove_primary_selection_after_rotation(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+
+        cx.set_state("«oneˇ» «twoˇ» «threeˇ»", Mode::HelixNormal);
+        cx.simulate_keystrokes(")");
+        cx.simulate_keystrokes("alt-,");
+        cx.assert_state("one «twoˇ» «threeˇ»", Mode::HelixNormal);
+        cx.simulate_keystrokes(",");
+        cx.assert_state("one «twoˇ» three", Mode::HelixNormal);
     }
 
     #[gpui::test]

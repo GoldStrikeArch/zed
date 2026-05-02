@@ -1366,6 +1366,10 @@ impl Vim {
             Mode::Normal => {
                 if let Some(operator) = self.operator_stack.last() {
                     match operator {
+                        // Vim jump labels are transient navigation, so keep the
+                        // user's normal cursor shape while waiting for the label.
+                        Operator::HelixJump { .. } => cursor_shape.normal,
+
                         // Navigation operators -> Block cursor
                         Operator::FindForward { .. }
                         | Operator::FindBackward { .. }

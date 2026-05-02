@@ -1712,7 +1712,7 @@ mod test {
     use editor::{HighlightKey, MultiBufferOffset};
     use gpui::{KeyBinding, UpdateGlobal, VisualTestContext};
     use indoc::indoc;
-    use language::Point;
+    use language::{CursorShape, Point};
     use project::FakeFs;
     use search::{ProjectSearchView, project_search};
     use serde_json::json;
@@ -3429,6 +3429,33 @@ mod test {
 
         cx.assert_state("one ˇtwo three", Mode::Normal);
         assert_eq!(cx.active_operator(), None);
+    }
+
+    #[gpui::test]
+    async fn test_vim_jump_keeps_normal_cursor_shape(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.vim.get_or_insert_default().cursor_shape =
+                        Some(settings::CursorShapeSettings {
+                            normal: Some(settings::CursorShape::Bar),
+                            ..Default::default()
+                        });
+                });
+            });
+        });
+        cx.set_state("ˇone two three", Mode::Normal);
+
+        cx.simulate_keystrokes("g z");
+
+        assert!(
+            matches!(cx.active_operator(), Some(Operator::HelixJump { .. })),
+            "expected HelixJump operator to be active"
+        );
+        cx.update_editor(|editor, _, _| {
+            assert_eq!(editor.cursor_shape(), CursorShape::Bar);
+        });
     }
 
     #[gpui::test]

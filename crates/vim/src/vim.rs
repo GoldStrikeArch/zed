@@ -1832,6 +1832,13 @@ impl Vim {
                     s.select_anchor_ranges([candidate.range.clone()])
                 });
             }
+            HelixJumpBehaviour::MoveToWordStart => {
+                editor.change_selections(Default::default(), window, cx, |s| {
+                    // Vim users expect jump labels to behave like motions, leaving
+                    // normal mode at the label instead of selecting the word.
+                    s.select_anchor_ranges([candidate.range.start..candidate.range.start])
+                });
+            }
             HelixJumpBehaviour::Extend => {
                 editor.change_selections(Default::default(), window, cx, |s| {
                     s.move_with(&mut |map, selection| {

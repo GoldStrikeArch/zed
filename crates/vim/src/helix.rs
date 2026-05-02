@@ -984,10 +984,12 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let behaviour = if self.mode.is_visual() {
-            HelixJumpBehaviour::Extend
-        } else {
-            HelixJumpBehaviour::Move
+        let behaviour = match self.mode {
+            // Vim normal mode treats jump-to-word as a cursor motion, while Helix
+            // normal mode treats the cursor as a single-character selection.
+            Mode::Normal => HelixJumpBehaviour::MoveToWordStart,
+            mode if mode.is_visual() => HelixJumpBehaviour::Extend,
+            _ => HelixJumpBehaviour::Move,
         };
         self.start_helix_jump(behaviour, window, cx);
     }
@@ -1773,7 +1775,11 @@ mod test {
     }
 
     fn jump_to_word(cx: &mut VimTestContext, target_word: &str) {
-        cx.simulate_keystrokes("g w");
+        jump_to_word_with_keystrokes(cx, "g w", target_word);
+    }
+
+    fn jump_to_word_with_keystrokes(cx: &mut VimTestContext, keystrokes: &str, target_word: &str) {
+        cx.simulate_keystrokes(keystrokes);
 
         let label = helix_jump_label_for_word(cx, target_word);
 
@@ -3411,6 +3417,28 @@ mod test {
         jump_to_word(&mut cx, "three");
 
         cx.assert_state("one two «threeˇ»", Mode::HelixNormal);
+        assert_eq!(cx.active_operator(), None);
+    }
+
+    #[gpui::test]
+    async fn test_vim_jump_moves_to_target_word_start(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.set_state("ˇone two three", Mode::Normal);
+
+        jump_to_word_with_keystrokes(&mut cx, "g z", "two");
+
+        cx.assert_state("one ˇtwo three", Mode::Normal);
+        assert_eq!(cx.active_operator(), None);
+    }
+
+    #[gpui::test]
+    async fn test_vim_visual_jump_extends_selection(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.set_state("one «twoˇ» three four", Mode::Visual);
+
+        jump_to_word_with_keystrokes(&mut cx, "g z", "three");
+
+        cx.assert_state("one «two threeˇ» four", Mode::Visual);
         assert_eq!(cx.active_operator(), None);
     }
 

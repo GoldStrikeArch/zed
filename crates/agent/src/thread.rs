@@ -4553,20 +4553,11 @@ mod tests {
     }
 
     fn configure_subagent_model(cx: &mut TestAppContext, selection: LanguageModelSelection) {
-        let selected_model = SelectedModel {
-            provider: LanguageModelProviderId::from(selection.provider.0.clone()),
-            model: LanguageModelId::from(selection.model.clone()),
-        };
-
         cx.update(|cx| {
             cx.update_global::<settings::SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.agent.get_or_insert_default().subagent_model = Some(selection.clone());
                 });
-            });
-
-            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
-                registry.select_subagent_model(Some(&selected_model), cx);
             });
         });
     }

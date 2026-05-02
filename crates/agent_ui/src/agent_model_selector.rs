@@ -1,5 +1,4 @@
 use crate::{
-    ModelUsageContext,
     language_model_selector::{
         LanguageModelSelector, LanguageModelSelectorAutomaticOption, LanguageModelSelectorFilter,
         language_model_selector,
@@ -8,7 +7,7 @@ use crate::{
 };
 use fs::Fs;
 use gpui::{Entity, FocusHandle, SharedString, Subscription};
-use language_model::{IconOrSvg, LanguageModel};
+use language_model::{IconOrSvg, LanguageModel, LanguageModelRegistry};
 use picker::popover_menu::PickerPopoverMenu;
 use settings::{Settings as _, update_settings_file};
 use std::sync::Arc;
@@ -17,8 +16,6 @@ use ui::{PopoverMenuHandle, Tooltip, prelude::*};
 pub struct AgentModelSelector {
     selector: Entity<LanguageModelSelector>,
     menu_handle: PopoverMenuHandle<LanguageModelSelector>,
-    button_id: &'static str,
-    label_prefix: Option<&'static str>,
 }
 
 impl AgentModelSelector {
@@ -26,34 +23,24 @@ impl AgentModelSelector {
         fs: Arc<dyn Fs>,
         menu_handle: PopoverMenuHandle<LanguageModelSelector>,
         focus_handle: FocusHandle,
-        model_usage_context: ModelUsageContext,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let button_id = model_usage_context.button_id();
-        let label_prefix = model_usage_context.label_prefix();
         Self {
             selector: cx.new(move |cx| {
                 language_model_selector(
-                    {
-                        let model_context = model_usage_context.clone();
-                        move |cx| model_context.configured_model(cx)
-                    },
+                    |cx| LanguageModelRegistry::read_global(cx).inline_assistant_model(),
                     {
                         let fs = fs.clone();
                         move |model, cx| {
                             let provider = model.provider_id().0.to_string();
                             let model_id = model.id().0.to_string();
-                            match &model_usage_context {
-                                ModelUsageContext::InlineAssistant => {
-                                    update_settings_file(fs.clone(), cx, move |settings, _cx| {
-                                        settings
-                                            .agent
-                                            .get_or_insert_default()
-                                            .set_inline_assistant_model(provider.clone(), model_id);
-                                    });
-                                }
-                            }
+                            update_settings_file(fs.clone(), cx, move |settings, _cx| {
+                                settings
+                                    .agent
+                                    .get_or_insert_default()
+                                    .set_inline_assistant_model(provider.clone(), model_id);
+                            });
                         }
                     },
                     {
@@ -67,7 +54,7 @@ impl AgentModelSelector {
                             );
                         }
                     },
-                    model_usage_context.model_filter(),
+                    LanguageModelSelectorFilter::All,
                     None,
                     true, // Use popover styles for picker
                     focus_handle.clone(),
@@ -76,8 +63,6 @@ impl AgentModelSelector {
                 )
             }),
             menu_handle,
-            button_id,
-            label_prefix,
         }
     }
 
@@ -253,10 +238,6 @@ impl Render for AgentModelSelector {
             .as_ref()
             .map(|model| model.model.name().0)
             .unwrap_or_else(|| SharedString::from("Select a Model"));
-        let label = self
-            .label_prefix
-            .map(|prefix| SharedString::from(format!("{prefix}: {}", model_name.as_ref())))
-            .unwrap_or(model_name);
 
         let provider_icon = model.as_ref().map(|model| model.provider.icon());
         let color = if self.menu_handle.is_deployed() {
@@ -277,7 +258,7 @@ impl Render for AgentModelSelector {
 
         PickerPopoverMenu::new(
             self.selector.clone(),
-            Button::new(self.button_id, label)
+            Button::new("active-model", model_name)
                 .label_size(LabelSize::Small)
                 .color(color)
                 .when_some(provider_icon, |this, icon| {

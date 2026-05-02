@@ -42,9 +42,7 @@ use crate::completion_provider::{
 use crate::mention_set::paste_images_as_context;
 use crate::mention_set::{MentionSet, crease_for_mention};
 use crate::terminal_codegen::TerminalCodegen;
-use crate::{
-    CycleFavoriteModels, CycleNextInlineAssist, CyclePreviousInlineAssist, ModelUsageContext,
-};
+use crate::{CycleFavoriteModels, CycleNextInlineAssist, CyclePreviousInlineAssist};
 
 actions!(inline_assistant, [ThumbsUpResult, ThumbsDownResult]);
 
@@ -1292,7 +1290,6 @@ impl PromptEditor<BufferCodegen> {
                     fs,
                     model_selector_menu_handle,
                     prompt_editor.focus_handle(cx),
-                    ModelUsageContext::InlineAssistant,
                     window,
                     cx,
                 )
@@ -1444,7 +1441,6 @@ impl PromptEditor<TerminalCodegen> {
                     fs,
                     model_selector_menu_handle.clone(),
                     prompt_editor.focus_handle(cx),
-                    ModelUsageContext::InlineAssistant,
                     window,
                     cx,
                 )

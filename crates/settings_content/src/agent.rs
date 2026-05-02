@@ -155,7 +155,8 @@ pub struct AgentSettingsContent {
     pub commit_message_model: Option<LanguageModelSelection>,
     /// Model to use for generating thread summaries. Defaults to default_model when not specified.
     pub thread_summary_model: Option<LanguageModelSelection>,
-    /// Model to use for subagents spawned via the spawn_agent tool. Defaults to default_model when not specified.
+    /// Model to use for subagents spawned via the spawn_agent tool.
+    /// Defaults to default_model when it supports tools, and otherwise inherits the parent thread's model.
     pub subagent_model: Option<LanguageModelSelection>,
     /// Additional models with which to generate alternatives when performing inline assists.
     pub inline_alternatives: Option<Vec<LanguageModelSelection>>,

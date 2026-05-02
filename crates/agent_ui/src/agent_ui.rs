@@ -48,9 +48,7 @@ use language::{
     LanguageRegistry,
     language_settings::{AllLanguageSettings, EditPredictionProvider},
 };
-use language_model::{
-    ConfiguredModel, LanguageModelId, LanguageModelProviderId, LanguageModelRegistry,
-};
+use language_model::{LanguageModelId, LanguageModelProviderId, LanguageModelRegistry};
 use project::{AgentId, DisableAiSettings};
 use prompt_store::PromptBuilder;
 use schemars::JsonSchema;
@@ -369,39 +367,6 @@ impl ManageProfiles {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum ModelUsageContext {
-    InlineAssistant,
-}
-
-impl ModelUsageContext {
-    pub fn configured_model(&self, cx: &App) -> Option<ConfiguredModel> {
-        match self {
-            Self::InlineAssistant => {
-                LanguageModelRegistry::read_global(cx).inline_assistant_model()
-            }
-        }
-    }
-
-    pub fn model_filter(&self) -> language_model_selector::LanguageModelSelectorFilter {
-        match self {
-            Self::InlineAssistant => language_model_selector::LanguageModelSelectorFilter::All,
-        }
-    }
-
-    pub fn button_id(&self) -> &'static str {
-        match self {
-            Self::InlineAssistant => "active-model",
-        }
-    }
-
-    pub fn label_prefix(&self) -> Option<&'static str> {
-        match self {
-            Self::InlineAssistant => None,
-        }
-    }
-}
-
 pub(crate) fn humanize_token_count(count: u64) -> String {
     match count {
         0..=999 => count.to_string(),
@@ -661,7 +626,6 @@ fn update_active_language_model_from_settings(cx: &mut App) {
         .thread_summary_model
         .as_ref()
         .map(to_selected_model);
-    let subagent = settings.subagent_model.as_ref().map(to_selected_model);
     let inline_alternatives = settings
         .inline_alternatives
         .iter()
@@ -673,7 +637,6 @@ fn update_active_language_model_from_settings(cx: &mut App) {
         registry.select_inline_assistant_model(inline_assistant.as_ref(), cx);
         registry.select_commit_message_model(commit_message.as_ref(), cx);
         registry.select_thread_summary_model(thread_summary.as_ref(), cx);
-        registry.select_subagent_model(subagent.as_ref(), cx);
         registry.select_inline_alternative_models(inline_alternatives, cx);
     });
 }

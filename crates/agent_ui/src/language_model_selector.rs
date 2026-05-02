@@ -211,8 +211,7 @@ impl LanguageModelPickerDelegate {
                         language_model::Event::DefaultModelChanged
                         | language_model::Event::InlineAssistantModelChanged
                         | language_model::Event::CommitMessageModelChanged
-                        | language_model::Event::ThreadSummaryModelChanged
-                        | language_model::Event::SubagentModelChanged => {
+                        | language_model::Event::ThreadSummaryModelChanged => {
                             picker.update_matches(picker.query(cx), window, cx)
                         }
                         _ => {}

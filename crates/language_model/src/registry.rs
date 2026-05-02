@@ -51,7 +51,6 @@ pub struct LanguageModelRegistry {
     inline_assistant_model: Option<ConfiguredModel>,
     commit_message_model: Option<ConfiguredModel>,
     thread_summary_model: Option<ConfiguredModel>,
-    subagent_model: Option<ConfiguredModel>,
     providers: BTreeMap<LanguageModelProviderId, Arc<dyn LanguageModelProvider>>,
     inline_alternatives: Vec<Arc<dyn LanguageModel>>,
     /// Set of installed extension IDs that provide language models.
@@ -112,7 +111,6 @@ pub enum Event {
     InlineAssistantModelChanged,
     CommitMessageModelChanged,
     ThreadSummaryModelChanged,
-    SubagentModelChanged,
     ProviderStateChanged(LanguageModelProviderId),
     AddedProvider(LanguageModelProviderId),
     RemovedProvider(LanguageModelProviderId),
@@ -125,11 +123,6 @@ impl EventEmitter<Event> for LanguageModelRegistry {}
 impl LanguageModelRegistry {
     pub fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalLanguageModelRegistry>().0.clone()
-    }
-
-    pub fn try_global(cx: &App) -> Option<Entity<Self>> {
-        cx.try_global::<GlobalLanguageModelRegistry>()
-            .map(|global| global.0.clone())
     }
 
     pub fn read_global(cx: &App) -> &Self {
@@ -331,11 +324,6 @@ impl LanguageModelRegistry {
         self.set_thread_summary_model(configured_model, cx);
     }
 
-    pub fn select_subagent_model(&mut self, model: Option<&SelectedModel>, cx: &mut Context<Self>) {
-        let configured_model = model.and_then(|model| self.select_model(model, cx));
-        self.set_subagent_model(configured_model, cx);
-    }
-
     /// Selects and sets the inline alternatives for language models based on
     /// provider name and id.
     pub fn select_inline_alternative_models(
@@ -429,15 +417,6 @@ impl LanguageModelRegistry {
         self.thread_summary_model = model;
     }
 
-    pub fn set_subagent_model(&mut self, model: Option<ConfiguredModel>, cx: &mut Context<Self>) {
-        match (self.subagent_model.as_ref(), model.as_ref()) {
-            (Some(old), Some(new)) if old.is_same_as(new) => {}
-            (None, None) => {}
-            _ => cx.emit(Event::SubagentModelChanged),
-        }
-        self.subagent_model = model;
-    }
-
     pub fn default_model(&self) -> Option<ConfiguredModel> {
         #[cfg(debug_assertions)]
         if std::env::var("ZED_SIMULATE_NO_LLM_PROVIDER").is_ok() {
@@ -491,17 +470,6 @@ impl LanguageModelRegistry {
             .clone()
             .or_else(|| self.default_fast_model(cx))
             .or_else(|| self.default_model())
-    }
-
-    pub fn subagent_model(&self) -> Option<ConfiguredModel> {
-        #[cfg(debug_assertions)]
-        if std::env::var("ZED_SIMULATE_NO_LLM_PROVIDER").is_ok() {
-            return None;
-        }
-
-        self.subagent_model
-            .clone()
-            .or_else(|| self.default_model.clone())
     }
 
     /// The models to use for inline assists. Returns the union of the active

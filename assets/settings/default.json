@@ -1031,7 +1031,8 @@
       "enable_thinking": false,
     },
     // Optional model to use for subagents spawned via `spawn_agent`.
-    // When omitted, subagents fall back to `default_model`.
+    // When omitted, subagents use `default_model` when it supports tools,
+    // and otherwise inherit the parent thread's model.
     //
     // Example:
     // "subagent_model": {

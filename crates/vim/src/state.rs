@@ -173,6 +173,7 @@ pub enum HelixJumpBehaviour {
     Move,
     MoveToWordStart,
     Extend,
+    ExtendToWordStart,
 }
 
 #[derive(Default, Clone, Debug)]

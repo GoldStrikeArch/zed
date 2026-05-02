@@ -988,7 +988,12 @@ impl Vim {
             // Vim normal mode treats jump-to-word as a cursor motion, while Helix
             // normal mode treats the cursor as a single-character selection.
             Mode::Normal => HelixJumpBehaviour::MoveToWordStart,
-            mode if mode.is_visual() => HelixJumpBehaviour::Extend,
+            // Vim visual mode extends like a motion, so the cursor stops at the
+            // same word boundary as normal mode instead of selecting the word.
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+                HelixJumpBehaviour::ExtendToWordStart
+            }
+            Mode::HelixSelect => HelixJumpBehaviour::Extend,
             _ => HelixJumpBehaviour::Move,
         };
         self.start_helix_jump(behaviour, window, cx);
@@ -3465,7 +3470,18 @@ mod test {
 
         jump_to_word_with_keystrokes(&mut cx, "g z", "three");
 
-        cx.assert_state("one «two threeˇ» four", Mode::Visual);
+        cx.assert_state("one «two tˇ»hree four", Mode::Visual);
+        assert_eq!(cx.active_operator(), None);
+    }
+
+    #[gpui::test]
+    async fn test_vim_visual_jump_extends_selection_backward(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.set_state("one two «threeˇ» four", Mode::Visual);
+
+        jump_to_word_with_keystrokes(&mut cx, "g z", "one");
+
+        cx.assert_state("«ˇone two three» four", Mode::Visual);
         assert_eq!(cx.active_operator(), None);
     }
 

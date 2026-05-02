@@ -119,7 +119,7 @@ impl SubagentModelSelector {
                                 });
                                 update_settings_file(fs.clone(), cx, move |settings, _cx| {
                                     settings.agent.get_or_insert_default().subagent_model =
-                                        Some(selection.clone());
+                                        Some(selection);
                                 });
                             }
                         },

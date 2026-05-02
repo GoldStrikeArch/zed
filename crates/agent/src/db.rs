@@ -11,6 +11,7 @@ use indoc::indoc;
 use language_model::Speed;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use settings::LanguageModelSelection;
 use sqlez::{
     bindable::{Bind, Column},
     connection::Connection,
@@ -72,6 +73,8 @@ pub struct DbThread {
     #[serde(default)]
     pub subagent_context: Option<crate::SubagentContext>,
     #[serde(default)]
+    pub subagent_model_selection: Option<LanguageModelSelection>,
+    #[serde(default)]
     pub speed: Option<Speed>,
     #[serde(default)]
     pub thinking_enabled: bool,
@@ -125,6 +128,7 @@ impl SharedThread {
             profile: None,
             imported: true,
             subagent_context: None,
+            subagent_model_selection: None,
             speed: None,
             thinking_enabled: false,
             thinking_effort: None,
@@ -304,6 +308,7 @@ impl DbThread {
             profile: thread.profile,
             imported: false,
             subagent_context: None,
+            subagent_model_selection: None,
             speed: None,
             thinking_enabled: false,
             thinking_effort: None,
@@ -689,6 +694,7 @@ mod tests {
             profile: None,
             imported: false,
             subagent_context: None,
+            subagent_model_selection: None,
             speed: None,
             thinking_enabled: false,
             thinking_effort: None,

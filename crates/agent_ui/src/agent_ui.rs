@@ -369,7 +369,7 @@ impl ManageProfiles {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) enum ModelUsageContext {
     InlineAssistant,
 }
@@ -380,6 +380,24 @@ impl ModelUsageContext {
             Self::InlineAssistant => {
                 LanguageModelRegistry::read_global(cx).inline_assistant_model()
             }
+        }
+    }
+
+    pub fn model_filter(&self) -> language_model_selector::LanguageModelSelectorFilter {
+        match self {
+            Self::InlineAssistant => language_model_selector::LanguageModelSelectorFilter::All,
+        }
+    }
+
+    pub fn button_id(&self) -> &'static str {
+        match self {
+            Self::InlineAssistant => "active-model",
+        }
+    }
+
+    pub fn label_prefix(&self) -> Option<&'static str> {
+        match self {
+            Self::InlineAssistant => None,
         }
     }
 }

@@ -1720,6 +1720,7 @@ mod tests {
             profile: None,
             imported: false,
             subagent_context: None,
+            subagent_model_selection: None,
             speed: None,
             thinking_enabled: false,
             thinking_effort: None,

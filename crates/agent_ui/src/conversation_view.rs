@@ -81,6 +81,7 @@ use crate::agent_connection_store::{
     AgentConnectedState, AgentConnectionEntryEvent, AgentConnectionStore,
 };
 use crate::agent_diff::AgentDiff;
+use crate::agent_model_selector::SubagentModelSelector;
 use crate::entry_view_state::{EntryViewEvent, ViewEvent};
 use crate::message_editor::{MessageEditor, MessageEditorEvent};
 use crate::profile_selector::{ProfileProvider, ProfileSelector};
@@ -1144,16 +1145,33 @@ impl ConversationView {
             .detach();
         }
 
-        let profile_selector: Option<Rc<agent::NativeAgentConnection>> =
-            connection.clone().downcast();
-        let profile_selector = profile_selector
-            .and_then(|native_connection| native_connection.thread(&session_id, cx))
+        let native_thread = connection
+            .clone()
+            .downcast::<agent::NativeAgentConnection>()
+            .and_then(|native_connection| native_connection.thread(&session_id, cx));
+
+        let profile_selector = native_thread.clone().map(|native_thread| {
+            cx.new(|cx| {
+                ProfileSelector::new(
+                    <dyn Fs>::global(cx),
+                    Arc::new(native_thread),
+                    self.focus_handle(cx),
+                    cx,
+                )
+            })
+        });
+
+        let subagent_model_selector = native_thread
+            .filter(|native_thread| !native_thread.read(cx).is_subagent())
             .map(|native_thread| {
+                let fs = self.project.read(cx).fs().clone();
                 cx.new(|cx| {
-                    ProfileSelector::new(
-                        <dyn Fs>::global(cx),
-                        Arc::new(native_thread),
+                    SubagentModelSelector::new(
+                        fs,
+                        native_thread,
+                        PopoverMenuHandle::default(),
                         self.focus_handle(cx),
+                        window,
                         cx,
                     )
                 })
@@ -1194,6 +1212,7 @@ impl ConversationView {
                 config_options_view,
                 mode_selector,
                 model_selector,
+                subagent_model_selector,
                 profile_selector,
                 list_state,
                 session_capabilities,

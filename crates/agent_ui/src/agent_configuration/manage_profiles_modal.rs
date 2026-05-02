@@ -19,7 +19,9 @@ use workspace::{ModalView, Workspace};
 
 use crate::agent_configuration::manage_profiles_modal::profile_modal_header::ProfileModalHeader;
 use crate::agent_configuration::tool_picker::{ToolPicker, ToolPickerDelegate};
-use crate::language_model_selector::{LanguageModelSelector, language_model_selector};
+use crate::language_model_selector::{
+    LanguageModelSelector, LanguageModelSelectorFilter, language_model_selector,
+};
 use crate::{AgentPanel, ManageProfiles};
 
 enum Mode {
@@ -285,6 +287,8 @@ impl ManageProfilesModal {
                         );
                     }
                 },
+                LanguageModelSelectorFilter::All,
+                None,
                 false, // Do not use popover styles for the model picker
                 self.focus_handle.clone(),
                 window,

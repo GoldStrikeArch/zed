@@ -32,12 +32,12 @@ use gpui::{
 };
 use heck::ToSnakeCase as _;
 use language_model::{
-    CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry,
-    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
-    LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
-    LanguageModelToolUse, LanguageModelToolUseId, Role, SelectedModel, Speed, StopReason,
-    TokenUsage, ZED_CLOUD_PROVIDER_ID,
+    CompletionIntent, ConfiguredModel, LanguageModel, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelId, LanguageModelImage, LanguageModelProviderId,
+    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
+    LanguageModelRequestTool, LanguageModelToolResult, LanguageModelToolResultContent,
+    LanguageModelToolSchemaFormat, LanguageModelToolUse, LanguageModelToolUseId, Role,
+    SelectedModel, Speed, StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
 };
 use project::Project;
 use prompt_store::ProjectContext;
@@ -977,6 +977,7 @@ pub struct Thread {
     imported: bool,
     /// If this is a subagent thread, contains context about the parent
     subagent_context: Option<SubagentContext>,
+    subagent_model_selection: Option<LanguageModelSelection>,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp::ContentBlock>>,
     ui_scroll_position: Option<gpui::ListOffset>,
@@ -992,16 +993,19 @@ impl Thread {
             .embedded_context(true)
     }
 
-    fn explicit_subagent_model_is_active(cx: &App) -> bool {
-        AgentSettings::get_global(cx)
-            .subagent_model
+    fn explicit_subagent_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
+        self.subagent_model_selection
             .as_ref()
             .and_then(|selection| Self::resolve_model_from_selection(selection, cx))
-            .is_some_and(|model| model.supports_tools())
+            .filter(|model| model.supports_tools())
+    }
+
+    fn explicit_subagent_model_is_active(&self, cx: &App) -> bool {
+        self.explicit_subagent_model(cx).is_some()
     }
 
     fn uses_dedicated_subagent_generation_settings(&self, cx: &App) -> bool {
-        self.is_subagent() && Self::explicit_subagent_model_is_active(cx)
+        self.is_subagent() && self.explicit_subagent_model_is_active(cx)
     }
 
     pub fn new_subagent(parent_thread: &Entity<Thread>, cx: &mut Context<Self>) -> Self {
@@ -1009,12 +1013,8 @@ impl Thread {
         let project_context = parent_thread.read(cx).project_context.clone();
         let context_server_registry = parent_thread.read(cx).context_server_registry.clone();
         let templates = parent_thread.read(cx).templates.clone();
-        let settings = AgentSettings::get_global(cx);
-        let subagent_selection = settings.subagent_model.clone();
-        let explicit_subagent_model = subagent_selection
-            .as_ref()
-            .and_then(|selection| Self::resolve_model_from_selection(selection, cx))
-            .filter(|model| model.supports_tools());
+        let subagent_selection = parent_thread.read(cx).subagent_model_selection.clone();
+        let explicit_subagent_model = parent_thread.read(cx).explicit_subagent_model(cx);
         let model = explicit_subagent_model
             .clone()
             .or_else(|| {
@@ -1036,17 +1036,17 @@ impl Thread {
             action_log,
             cx,
         );
-        if explicit_subagent_model.is_some() {
-            if let Some(selection) = subagent_selection {
-                thread.thinking_enabled = selection.enable_thinking;
-                thread.thinking_effort = selection.effort;
-            }
-        }
         thread.subagent_context = Some(SubagentContext {
             parent_thread_id: parent_thread.read(cx).id().clone(),
             depth: parent_thread.read(cx).depth() + 1,
         });
         thread.inherit_parent_settings(parent_thread, cx);
+        if explicit_subagent_model.is_some()
+            && let Some(selection) = subagent_selection
+        {
+            thread.thinking_enabled = selection.enable_thinking;
+            thread.thinking_effort = selection.effort;
+        }
         thread
     }
 
@@ -1092,6 +1092,7 @@ impl Thread {
             .default_model
             .as_ref()
             .and_then(|model| model.speed);
+        let subagent_model_selection = settings.subagent_model.clone();
         let (prompt_capabilities_tx, prompt_capabilities_rx) =
             watch::channel(Self::prompt_capabilities(model.as_deref()));
         Self {
@@ -1132,6 +1133,7 @@ impl Thread {
             action_log,
             imported: false,
             subagent_context: None,
+            subagent_model_selection,
             draft_prompt: None,
             ui_scroll_position: None,
             running_subagents: Vec::new(),
@@ -1149,6 +1151,7 @@ impl Thread {
         self.thinking_effort = parent.thinking_effort.clone();
         self.summarization_model = parent.summarization_model.clone();
         self.profile_id = parent.profile_id.clone();
+        self.subagent_model_selection = parent.subagent_model_selection.clone();
     }
 
     pub fn id(&self) -> &acp::SessionId {
@@ -1362,6 +1365,7 @@ impl Thread {
             prompt_capabilities_rx,
             imported: db_thread.imported,
             subagent_context: db_thread.subagent_context,
+            subagent_model_selection: db_thread.subagent_model_selection,
             draft_prompt: db_thread.draft_prompt,
             ui_scroll_position: db_thread.ui_scroll_position.map(|sp| gpui::ListOffset {
                 item_ix: sp.item_ix,
@@ -1388,6 +1392,7 @@ impl Thread {
             profile: Some(self.profile_id.clone()),
             imported: self.imported,
             subagent_context: self.subagent_context.clone(),
+            subagent_model_selection: self.subagent_model_selection.clone(),
             speed: self.speed,
             thinking_enabled: self.thinking_enabled,
             thinking_effort: self.thinking_effort.clone(),
@@ -1459,6 +1464,30 @@ impl Thread {
         self.model.as_ref()
     }
 
+    pub fn subagent_model_selection(&self) -> Option<&LanguageModelSelection> {
+        self.subagent_model_selection.as_ref()
+    }
+
+    pub fn configured_subagent_model(&self, cx: &App) -> Option<ConfiguredModel> {
+        self.subagent_model_selection
+            .as_ref()
+            .and_then(|selection| Self::resolve_configured_model_from_selection(selection, cx))
+            .filter(|configured| configured.model.supports_tools())
+    }
+
+    pub fn set_subagent_model_selection(
+        &mut self,
+        selection: Option<LanguageModelSelection>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.subagent_model_selection == selection {
+            return;
+        }
+
+        self.subagent_model_selection = selection;
+        cx.notify();
+    }
+
     pub fn set_model(&mut self, model: Arc<dyn LanguageModel>, cx: &mut Context<Self>) {
         let old_usage = self.latest_token_usage();
         self.model = Some(model.clone());
@@ -1469,7 +1498,7 @@ impl Thread {
         }
         self.prompt_capabilities_tx.send(new_caps).log_err();
 
-        if !Self::explicit_subagent_model_is_active(cx) {
+        if !self.explicit_subagent_model_is_active(cx) {
             for subagent in &self.running_subagents {
                 subagent
                     .update(cx, |thread, cx| thread.set_model(model.clone(), cx))
@@ -1508,7 +1537,7 @@ impl Thread {
     pub fn set_thinking_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.thinking_enabled = enabled;
 
-        if !Self::explicit_subagent_model_is_active(cx) {
+        if !self.explicit_subagent_model_is_active(cx) {
             for subagent in &self.running_subagents {
                 subagent
                     .update(cx, |thread, cx| thread.set_thinking_enabled(enabled, cx))
@@ -1525,7 +1554,7 @@ impl Thread {
     pub fn set_thinking_effort(&mut self, effort: Option<String>, cx: &mut Context<Self>) {
         self.thinking_effort = effort.clone();
 
-        if !Self::explicit_subagent_model_is_active(cx) {
+        if !self.explicit_subagent_model_is_active(cx) {
             for subagent in &self.running_subagents {
                 subagent
                     .update(cx, |thread, cx| {
@@ -1544,7 +1573,7 @@ impl Thread {
     pub fn set_speed(&mut self, speed: Speed, cx: &mut Context<Self>) {
         self.speed = Some(speed);
 
-        if !Self::explicit_subagent_model_is_active(cx) {
+        if !self.explicit_subagent_model_is_active(cx) {
             for subagent in &self.running_subagents {
                 subagent
                     .update(cx, |thread, cx| thread.set_speed(speed, cx))
@@ -1783,17 +1812,26 @@ impl Thread {
         selection: &LanguageModelSelection,
         cx: &App,
     ) -> Option<Arc<dyn LanguageModel>> {
+        Self::resolve_configured_model_from_selection(selection, cx)
+            .map(|configured| configured.model)
+    }
+
+    fn resolve_configured_model_from_selection(
+        selection: &LanguageModelSelection,
+        cx: &App,
+    ) -> Option<ConfiguredModel> {
         let selected = SelectedModel {
             provider: LanguageModelProviderId::from(selection.provider.0.clone()),
             model: LanguageModelId::from(selection.model.clone()),
         };
         let registry = LanguageModelRegistry::try_read_global(cx)?;
         let provider = registry.provider(&selected.provider)?;
-        provider
+        let model = provider
             .provided_models(cx)
             .iter()
             .find(|model| model.id() == selected.model)
-            .cloned()
+            .cloned()?;
+        Some(ConfiguredModel { provider, model })
     }
 
     pub fn resume(
@@ -4393,14 +4431,6 @@ mod tests {
             self.inner.max_token_count()
         }
 
-        fn count_tokens(
-            &self,
-            request: LanguageModelRequest,
-            cx: &App,
-        ) -> BoxFuture<'static, http_client::Result<u64>> {
-            self.inner.count_tokens(request, cx)
-        }
-
         fn stream_completion(
             &self,
             request: LanguageModelRequest,
@@ -4518,6 +4548,7 @@ mod tests {
             model: model_id.to_string(),
             enable_thinking,
             effort: effort.map(ToOwned::to_owned),
+            speed: None,
         }
     }
 
@@ -4536,6 +4567,19 @@ mod tests {
 
             LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
                 registry.select_subagent_model(Some(&selected_model), cx);
+            });
+        });
+    }
+
+    fn configure_thread_subagent_model(
+        cx: &mut TestAppContext,
+        parent: &Entity<Thread>,
+        selection: LanguageModelSelection,
+    ) {
+        configure_subagent_model(cx, selection.clone());
+        cx.update(|cx| {
+            parent.update(cx, |thread, cx| {
+                thread.set_subagent_model_selection(Some(selection), cx);
             });
         });
     }
@@ -4611,8 +4655,9 @@ mod tests {
         let parent_model =
             register_test_model(cx, "parent-provider", "parent-model", "Parent Model", false);
 
-        configure_subagent_model(
+        configure_thread_subagent_model(
             cx,
+            &parent,
             selection("subagent-provider", "subagent-model", true, Some("high")),
         );
 
@@ -4666,6 +4711,43 @@ mod tests {
                 subagent.read(cx).speed(),
                 None,
                 "Parent speed changes should not retune a subagent with a dedicated model override",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_automatic_subagent_model_uses_parent_model(cx: &mut TestAppContext) {
+        let (parent, _event_stream) = setup_thread_for_test(cx).await;
+        register_test_model(
+            cx,
+            "subagent-provider",
+            "subagent-model",
+            "Subagent Model",
+            true,
+        );
+        let parent_model =
+            register_test_model(cx, "parent-provider", "parent-model", "Parent Model", false);
+
+        configure_thread_subagent_model(
+            cx,
+            &parent,
+            selection("subagent-provider", "subagent-model", true, Some("high")),
+        );
+
+        cx.update(|cx| {
+            parent.update(cx, |thread, cx| {
+                thread.set_model(parent_model.clone(), cx);
+                thread.set_subagent_model_selection(None, cx);
+            });
+        });
+
+        let subagent = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent, cx)));
+
+        cx.update(|cx| {
+            assert_eq!(
+                subagent.read(cx).model().unwrap().id(),
+                parent_model.id(),
+                "Automatic subagent model selection should fall back to the parent model",
             );
         });
     }
@@ -4825,8 +4907,9 @@ mod tests {
             false,
         );
 
-        configure_subagent_model(
+        configure_thread_subagent_model(
             cx,
+            &parent,
             selection("subagent-provider", "subagent-model", true, Some("high")),
         );
         configure_profile_model(

@@ -10,6 +10,7 @@ use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCo
 use editor::actions::OpenExcerpts;
 use feature_flags::AcpBetaFeatureFlag;
 
+use crate::agent_model_selector::SubagentModelSelector;
 use crate::message_editor::SharedSessionCapabilities;
 
 use gpui::List;
@@ -278,6 +279,7 @@ pub struct ThreadView {
     pub config_options_view: Option<Entity<ConfigOptionsView>>,
     pub mode_selector: Option<Entity<ModeSelector>>,
     pub model_selector: Option<Entity<ModelSelectorPopover>>,
+    pub subagent_model_selector: Option<Entity<SubagentModelSelector>>,
     pub profile_selector: Option<Entity<ProfileSelector>>,
     pub permission_dropdown_handle: PopoverMenuHandle<ContextMenu>,
     pub thread_retry_status: Option<RetryStatus>,
@@ -364,6 +366,7 @@ impl ThreadView {
         config_options_view: Option<Entity<ConfigOptionsView>>,
         mode_selector: Option<Entity<ModeSelector>>,
         model_selector: Option<Entity<ModelSelectorPopover>>,
+        subagent_model_selector: Option<Entity<SubagentModelSelector>>,
         profile_selector: Option<Entity<ProfileSelector>>,
         list_state: ListState,
         session_capabilities: SharedSessionCapabilities,
@@ -504,6 +507,7 @@ impl ThreadView {
             config_options_view,
             mode_selector,
             model_selector,
+            subagent_model_selector,
             profile_selector,
             list_state,
             session_capabilities,
@@ -3284,7 +3288,8 @@ impl ThreadView {
                                         Some(config_view) => this.child(config_view),
                                         None => this
                                             .children(self.mode_selector.clone())
-                                            .children(self.model_selector.clone()),
+                                            .children(self.model_selector.clone())
+                                            .children(self.subagent_model_selector.clone()),
                                     })
                                     .child(self.render_send_button(cx)),
                             ),

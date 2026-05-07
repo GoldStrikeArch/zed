@@ -751,6 +751,7 @@ impl Editor {
             .collect();
         self.toggle_diff_hunks_in_ranges(ranges, cx);
     }
+
     pub(super) fn refresh_single_line_folds(
         &mut self,
         window: &mut Window,

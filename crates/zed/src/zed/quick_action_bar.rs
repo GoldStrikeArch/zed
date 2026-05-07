@@ -8,7 +8,7 @@ use editor::actions::{
     SelectLargerSyntaxNode, SelectNext, SelectSmallerSyntaxNode, ToggleCodeActions,
     ToggleDiagnostics, ToggleGoToLine, ToggleInlineDiagnostics,
 };
-use editor::code_context_menus::{CodeContextMenu, ContextMenuOrigin};
+use editor::code_context_menus::ContextMenuOrigin;
 use editor::{Editor, EditorSettings};
 use gpui::{
     Action, Anchor, AnchoredPositionMode, ClickEvent, Context, ElementId, Entity, EventEmitter,
@@ -170,15 +170,10 @@ impl Render for QuickActionBar {
         );
 
         let code_actions_dropdown = code_action_enabled.then(|| {
-            let is_deployed = {
-                let menu_ref = editor.read(cx).context_menu().borrow();
-                let code_action_menu = menu_ref
-                    .as_ref()
-                    .filter(|menu| matches!(menu, CodeContextMenu::CodeActions(..)));
-                code_action_menu
-                    .as_ref()
-                    .is_some_and(|menu| matches!(menu.origin(), ContextMenuOrigin::QuickActionBar))
-            };
+            let is_deployed = editor
+                .read(cx)
+                .code_actions_menu_origin()
+                .is_some_and(|origin| matches!(origin, ContextMenuOrigin::QuickActionBar));
             let code_action_element = is_deployed
                 .then(|| {
                     editor.update(cx, |editor, cx| {

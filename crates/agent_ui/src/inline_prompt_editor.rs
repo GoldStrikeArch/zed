@@ -2,7 +2,6 @@ use agent::ThreadStore;
 use agent_settings::AgentSettings;
 use collections::{HashMap, VecDeque};
 use editor::actions::Paste;
-use editor::code_context_menus::CodeContextMenu;
 use editor::display_map::{CreaseId, EditorMargins};
 use editor::{AnchorRangeExt as _, MultiBufferOffset, ToOffset as _};
 use editor::{
@@ -475,19 +474,12 @@ impl<T: 'static> PromptEditor<T> {
     }
 
     pub fn is_completions_menu_visible(&self, cx: &App) -> bool {
-        self.editor
-            .read(cx)
-            .context_menu()
-            .borrow()
-            .as_ref()
-            .is_some_and(|menu| matches!(menu, CodeContextMenu::Completions(_)) && menu.visible())
+        self.editor.read(cx).has_visible_completions_menu()
     }
 
     pub fn trigger_completion_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
-            let menu_is_open = editor.context_menu().borrow().as_ref().is_some_and(|menu| {
-                matches!(menu, CodeContextMenu::Completions(_)) && menu.visible()
-            });
+            let menu_is_open = editor.has_visible_completions_menu();
 
             let has_at_sign = {
                 let snapshot = editor.display_snapshot(cx);

@@ -9,7 +9,6 @@ use command_palette::CommandPalette;
 use editor::{
     AnchorRangeExt, DisplayPoint, Editor, EditorMode, MultiBuffer, MultiBufferOffset,
     actions::{DeleteLine, WrapSelectionsInTag},
-    code_context_menus::CodeContextMenu,
     display_map::DisplayRow,
     test::editor_test_context::EditorTestContext,
 };
@@ -1165,60 +1164,55 @@ async fn test_completion_menu_scroll_aside(cx: &mut TestAppContext) {
     let mut initial_offset: Pixels = px(0.0);
 
     cx.update_editor(|editor, _, _| {
-        let binding = editor.context_menu().borrow();
-        let Some(CodeContextMenu::Completions(menu)) = binding.as_ref() else {
+        let Some(offset) = editor.completions_menu_aside_scroll_y_offset() else {
             panic!("Should have completions menu open");
         };
 
-        initial_offset = menu.scroll_handle_aside.offset().y;
+        initial_offset = offset;
     });
 
     // The `ctrl-e` shortcut should scroll the completion menu's aside content
     // down, so the updated offset should be lower than the initial offset.
     cx.simulate_keystroke("ctrl-e");
     cx.update_editor(|editor, _, _| {
-        let binding = editor.context_menu().borrow();
-        let Some(CodeContextMenu::Completions(menu)) = binding.as_ref() else {
+        let Some(offset) = editor.completions_menu_aside_scroll_y_offset() else {
             panic!("Should have completions menu open");
         };
 
-        assert!(menu.scroll_handle_aside.offset().y < initial_offset);
+        assert!(offset < initial_offset);
     });
 
     // The `ctrl-y` shortcut should do the inverse scrolling as `ctrl-e`, so the
     // offset should now be the same as the initial offset.
     cx.simulate_keystroke("ctrl-y");
     cx.update_editor(|editor, _, _| {
-        let binding = editor.context_menu().borrow();
-        let Some(CodeContextMenu::Completions(menu)) = binding.as_ref() else {
+        let Some(offset) = editor.completions_menu_aside_scroll_y_offset() else {
             panic!("Should have completions menu open");
         };
 
-        assert_eq!(menu.scroll_handle_aside.offset().y, initial_offset);
+        assert_eq!(offset, initial_offset);
     });
 
     // The `ctrl-d` shortcut should scroll the completion menu's aside content
     // down, so the updated offset should be lower than the initial offset.
     cx.simulate_keystroke("ctrl-d");
     cx.update_editor(|editor, _, _| {
-        let binding = editor.context_menu().borrow();
-        let Some(CodeContextMenu::Completions(menu)) = binding.as_ref() else {
+        let Some(offset) = editor.completions_menu_aside_scroll_y_offset() else {
             panic!("Should have completions menu open");
         };
 
-        assert!(menu.scroll_handle_aside.offset().y < initial_offset);
+        assert!(offset < initial_offset);
     });
 
     // The `ctrl-u` shortcut should do the inverse scrolling as `ctrl-u`, so the
     // offset should now be the same as the initial offset.
     cx.simulate_keystroke("ctrl-u");
     cx.update_editor(|editor, _, _| {
-        let binding = editor.context_menu().borrow();
-        let Some(CodeContextMenu::Completions(menu)) = binding.as_ref() else {
+        let Some(offset) = editor.completions_menu_aside_scroll_y_offset() else {
             panic!("Should have completions menu open");
         };
 
-        assert_eq!(menu.scroll_handle_aside.offset().y, initial_offset);
+        assert_eq!(offset, initial_offset);
     });
 }
 

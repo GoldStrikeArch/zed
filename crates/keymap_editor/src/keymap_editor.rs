@@ -2920,13 +2920,7 @@ impl KeybindingEditorModal {
         let is_editor_showing_completions =
             |focus_handle: &FocusHandle, editor_entity: &Entity<Editor>| -> bool {
                 focus_handle.contains_focused(window, cx)
-                    && editor_entity.read_with(cx, |editor, _cx| {
-                        editor
-                            .context_menu()
-                            .borrow()
-                            .as_ref()
-                            .is_some_and(|menu| menu.visible())
-                    })
+                    && editor_entity.read_with(cx, |editor, _cx| editor.context_menu_visible())
             };
 
         self.action_editor.as_ref().is_some_and(|action_editor| {

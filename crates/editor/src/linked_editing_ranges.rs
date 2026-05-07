@@ -1,5 +1,5 @@
 use collections::HashMap;
-use gpui::{AppContext, Context, Entity, Window};
+use gpui::{App, AppContext, Context, Entity, Window};
 use itertools::Itertools;
 use language::Buffer;
 use std::{ops::Range, sync::Arc, time::Duration};
@@ -160,6 +160,76 @@ pub(super) fn refresh_linked_ranges(
         Some(())
     }));
     None
+}
+
+impl Editor {
+    fn linked_editing_ranges_for(
+        &self,
+        query_range: Range<Anchor>,
+        cx: &App,
+    ) -> Option<HashMap<Entity<Buffer>, Vec<Range<Anchor>>>> {
+        use text::ToOffset as TO;
+
+        if self.linked_edit_ranges.is_empty() {
+            return None;
+        }
+        if query_range.start.buffer_id != query_range.end.buffer_id {
+            return None;
+        };
+        let multibuffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let buffer = self.buffer.read(cx).buffer(query_range.end.buffer_id)?;
+        let buffer_snapshot = buffer.read(cx).snapshot();
+        let (base_range, linked_ranges) = self.linked_edit_ranges.get(
+            buffer_snapshot.remote_id(),
+            query_range.clone(),
+            &buffer_snapshot,
+        )?;
+        // find offset from the start of current range to current cursor position
+        let start_byte_offset = TO::to_offset(&base_range.start, &buffer_snapshot);
+
+        let start_offset = TO::to_offset(&query_range.start, &buffer_snapshot);
+        let start_difference = start_offset - start_byte_offset;
+        let end_offset = TO::to_offset(&query_range.end, &buffer_snapshot);
+        let end_difference = end_offset - start_byte_offset;
+
+        // Current range has associated linked ranges.
+        let mut linked_edits = HashMap::<_, Vec<_>>::default();
+        for range in linked_ranges.iter() {
+            let start_offset = TO::to_offset(&range.start, &buffer_snapshot);
+            let end_offset = start_offset + end_difference;
+            let start_offset = start_offset + start_difference;
+            if start_offset > buffer_snapshot.len() || end_offset > buffer_snapshot.len() {
+                continue;
+            }
+            if self.selections.disjoint_anchor_ranges().any(|s| {
+                let Some((selection_start, _)) =
+                    multibuffer_snapshot.anchor_to_buffer_anchor(s.start)
+                else {
+                    return false;
+                };
+                let Some((selection_end, _)) = multibuffer_snapshot.anchor_to_buffer_anchor(s.end)
+                else {
+                    return false;
+                };
+                if selection_start.buffer_id != query_range.start.buffer_id
+                    || selection_end.buffer_id != query_range.end.buffer_id
+                {
+                    return false;
+                }
+                TO::to_offset(&selection_start, &buffer_snapshot) <= end_offset
+                    && TO::to_offset(&selection_end, &buffer_snapshot) >= start_offset
+            }) {
+                continue;
+            }
+            let start = buffer_snapshot.anchor_after(start_offset);
+            let end = buffer_snapshot.anchor_after(end_offset);
+            linked_edits
+                .entry(buffer.clone())
+                .or_default()
+                .push(start..end);
+        }
+        Some(linked_edits)
+    }
 }
 
 /// Accumulates edits destined for linked editing ranges, for example, matching

@@ -16,7 +16,6 @@ use editor::{
     Addon, AnchorRangeExt, ContextMenuOptions, Editor, EditorElement, EditorEvent, EditorMode,
     EditorStyle, Inlay, MultiBuffer, MultiBufferOffset, MultiBufferSnapshot, ToOffset,
     actions::{Copy, Paste},
-    code_context_menus::CodeContextMenu,
     scroll::Autoscroll,
 };
 use futures::{FutureExt as _, future::join_all};
@@ -681,12 +680,7 @@ impl MessageEditor {
     }
 
     pub fn is_completions_menu_visible(&self, cx: &App) -> bool {
-        self.editor
-            .read(cx)
-            .context_menu()
-            .borrow()
-            .as_ref()
-            .is_some_and(|menu| matches!(menu, CodeContextMenu::Completions(_)) && menu.visible())
+        self.editor.read(cx).has_visible_completions_menu()
     }
 
     #[cfg(test)]
@@ -897,10 +891,7 @@ impl MessageEditor {
         cx.spawn_in(window, async move |_, cx| {
             editor
                 .update_in(cx, |editor, window, cx| {
-                    let menu_is_open =
-                        editor.context_menu().borrow().as_ref().is_some_and(|menu| {
-                            matches!(menu, CodeContextMenu::Completions(_)) && menu.visible()
-                        });
+                    let menu_is_open = editor.has_visible_completions_menu();
 
                     let has_prefix = {
                         let snapshot = editor.display_snapshot(cx);

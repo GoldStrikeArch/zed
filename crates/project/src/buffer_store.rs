@@ -466,6 +466,11 @@ impl LocalBufferStore {
         cx: &mut Context<BufferStore>,
     ) {
         let snapshot = worktree_handle.read(cx).snapshot();
+        log::info!(
+            "[fs-sync] buffer store received worktree entries worktree_id={:?} change_count={}",
+            snapshot.id(),
+            changes.len(),
+        );
         for (path, entry_id, _) in changes {
             Self::local_worktree_entry_changed(
                 this,
@@ -556,6 +561,14 @@ impl LocalBufferStore {
                 return None;
             }
 
+            log::info!(
+                "[fs-sync] buffer store updating buffer file buffer_id={buffer_id:?} worktree_id={:?} path={} entry_id={:?} old_disk_state={:?} new_disk_state={:?}",
+                snapshot.id(),
+                new_file.path.display(snapshot.path_style()),
+                new_file.entry_id,
+                old_file.disk_state,
+                new_file.disk_state,
+            );
             let mut events = Vec::new();
             if new_file.path != old_file.path {
                 this.path_to_buffer_id.remove(&ProjectPath {
@@ -754,6 +767,10 @@ impl LocalBufferStore {
         cx.spawn(async move |_, cx| {
             let mut project_transaction = ProjectTransaction::default();
             for buffer in buffers {
+                let buffer_id = buffer.update(cx, |buffer, _| buffer.remote_id());
+                log::info!(
+                    "[fs-sync] reloading buffer from disk buffer_id={buffer_id:?} push_to_history={push_to_history}"
+                );
                 let transaction = buffer.update(cx, |buffer, cx| buffer.reload(cx)).await?;
                 buffer.update(cx, |buffer, cx| {
                     if let Some(transaction) = transaction {

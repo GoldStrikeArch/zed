@@ -1678,7 +1678,14 @@ impl Buffer {
             let new_state = new_file.disk_state();
             if old_state != new_state {
                 file_changed = true;
-                if !was_dirty && matches!(new_state, DiskState::Present { .. }) {
+                let should_emit_reload_needed =
+                    !was_dirty && matches!(new_state, DiskState::Present { .. });
+                log::info!(
+                    "[fs-sync] buffer file_updated old_path={:?} new_path={:?} was_dirty={was_dirty} old_disk_state={old_state:?} new_disk_state={new_state:?} emit_reload_needed={should_emit_reload_needed}",
+                    old_file.path(),
+                    new_file.path(),
+                );
+                if should_emit_reload_needed {
                     cx.emit(BufferEvent::ReloadNeeded)
                 }
             }

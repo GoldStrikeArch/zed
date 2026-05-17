@@ -1472,6 +1472,10 @@ impl GitStore {
 
         match event {
             WorktreeStoreEvent::WorktreeUpdatedEntries(worktree_id, updated_entries) => {
+                log::info!(
+                    "[fs-sync] git store received worktree entries worktree_id={worktree_id:?} entry_count={}",
+                    updated_entries.len(),
+                );
                 if let Some(worktree) = self
                     .worktree_store
                     .read(cx)
@@ -1484,8 +1488,21 @@ impl GitStore {
                         .map(|downstream| downstream.updates_tx.clone());
                     cx.spawn(async move |_, cx| {
                         let paths_by_git_repo = paths_by_git_repo.await;
+                        log::info!(
+                            "[fs-sync] git store mapped worktree entries repo_count={} path_counts={:?}",
+                            paths_by_git_repo.len(),
+                            paths_by_git_repo
+                                .values()
+                                .map(|paths| paths.len())
+                                .collect::<Vec<_>>(),
+                        );
                         for (repo, paths) in paths_by_git_repo {
                             repo.update(cx, |repo, cx| {
+                                log::info!(
+                                    "[fs-sync] git store scheduling path status refresh repo_id={:?} path_count={} paths={paths:?}",
+                                    repo.id,
+                                    paths.len(),
+                                );
                                 repo.paths_changed(paths, downstream.clone(), cx);
                             });
                         }
@@ -1494,6 +1511,10 @@ impl GitStore {
                 }
             }
             WorktreeStoreEvent::WorktreeUpdatedGitRepositories(worktree_id, changed_repos) => {
+                log::info!(
+                    "[fs-sync] git store received worktree git repositories worktree_id={worktree_id:?} repo_change_count={}",
+                    changed_repos.len(),
+                );
                 let Some(worktree) = worktree_store.read(cx).worktree_for_id(*worktree_id, cx)
                 else {
                     return;
@@ -3615,6 +3636,11 @@ impl GitStore {
             .into_iter()
             .map(|path| worktree.absolutize(&path))
             .collect::<Arc<[_]>>();
+        log::info!(
+            "[fs-sync] git store processing updated entries repo_count={} entry_count={} entries={entries:?}",
+            repo_paths.len(),
+            entries.len(),
+        );
 
         let executor = cx.background_executor().clone();
         cx.background_executor().spawn(async move {
@@ -3668,6 +3694,14 @@ impl GitStore {
                 }
             }
 
+            log::info!(
+                "[fs-sync] git store processed updated entries repo_count={} path_counts={:?}",
+                paths_by_git_repo.len(),
+                paths_by_git_repo
+                    .values()
+                    .map(|paths| paths.len())
+                    .collect::<Vec<_>>(),
+            );
             paths_by_git_repo
         })
     }
@@ -7762,6 +7796,11 @@ impl Repository {
         updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
         cx: &mut Context<Self>,
     ) {
+        log::info!(
+            "[fs-sync] git repository scheduling full scan repo_id={:?} work_directory={}",
+            self.id,
+            self.work_directory_abs_path.display(),
+        );
         let this = cx.weak_entity();
         let _ = self.send_keyed_job(
             "schedule_scan",
@@ -8004,6 +8043,13 @@ impl Repository {
         updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
         cx: &mut Context<Self>,
     ) {
+        let repo_id = self.id;
+        let work_directory_abs_path = self.work_directory_abs_path.clone();
+        log::info!(
+            "[fs-sync] git repository paths changed repo_id={repo_id:?} work_directory={} path_count={} paths={paths:?}",
+            work_directory_abs_path.display(),
+            paths.len(),
+        );
         if !paths.is_empty() {
             self.paths_needing_status_update.push(paths);
         }
@@ -8013,18 +8059,27 @@ impl Repository {
             "paths_changed",
             Some(GitJobKey::RefreshStatuses),
             None,
-            |state, mut cx| async move {
+            move |state, mut cx| async move {
                 let (prev_snapshot, changed_paths) = this.update(&mut cx, |this, _| {
                     (
                         this.snapshot.clone(),
                         mem::take(&mut this.paths_needing_status_update),
                     )
                 })?;
+                let changed_path_batch_count = changed_paths.len();
+                let changed_path_count = changed_paths.iter().map(Vec::len).sum::<usize>();
+                log::info!(
+                    "[fs-sync] git status refresh dequeued repo_id={repo_id:?} work_directory={} batch_count={changed_path_batch_count} path_count={changed_path_count} paths={changed_paths:?}",
+                    work_directory_abs_path.display(),
+                );
                 let RepositoryState::Local(LocalRepositoryState { backend, .. }) = state else {
                     bail!("not a local repository")
                 };
 
                 if changed_paths.is_empty() {
+                    log::info!(
+                        "[fs-sync] git status refresh skipped repo_id={repo_id:?} because no paths remained"
+                    );
                     return Ok(());
                 }
 
@@ -8036,6 +8091,11 @@ impl Repository {
                         let mut changed_paths =
                             changed_paths.into_iter().flatten().collect::<BTreeSet<_>>();
                         let changed_paths_vec = changed_paths.iter().cloned().collect::<Vec<_>>();
+                        log::info!(
+                            "[fs-sync] running git status repo_id={repo_id:?} work_directory={} path_count={} paths={changed_paths_vec:?}",
+                            work_directory_abs_path.display(),
+                            changed_paths_vec.len(),
+                        );
 
                         let status_task = backend.status(&changed_paths_vec);
                         let diff_stat_future = if has_head {
@@ -8049,6 +8109,11 @@ impl Repository {
 
                         let (statuses, diff_stats) =
                             futures::future::try_join(status_task, diff_stat_future).await?;
+                        log::info!(
+                            "[fs-sync] git status returned repo_id={repo_id:?} status_count={} diff_stat_count={}",
+                            statuses.entries.len(),
+                            diff_stats.entries.len(),
+                        );
 
                         let diff_stats: HashMap<RepoPath, DiffStat> =
                             HashMap::from_iter(diff_stats.entries.into_iter().cloned());
@@ -8082,6 +8147,10 @@ impl Repository {
                                     .push(Edit::Remove(PathKey(path.as_ref().clone())));
                             }
                         }
+                        log::info!(
+                            "[fs-sync] git status computed edits repo_id={repo_id:?} edit_count={}",
+                            changed_path_statuses.len(),
+                        );
                         anyhow::Ok(changed_path_statuses)
                     })
                     .await?;
@@ -8093,11 +8162,21 @@ impl Repository {
                     }
 
                     if !changed_path_statuses.is_empty() {
+                        log::info!(
+                            "[fs-sync] git status applying edits repo_id={repo_id:?} edit_count={} old_scan_id={}",
+                            changed_path_statuses.len(),
+                            this.snapshot.scan_id,
+                        );
                         cx.emit(RepositoryEvent::StatusesChanged);
                         this.snapshot
                             .statuses_by_path
                             .edit(changed_path_statuses, ());
                         this.snapshot.scan_id += 1;
+                    } else {
+                        log::info!(
+                            "[fs-sync] git status produced no repository edits repo_id={repo_id:?} scan_id={}",
+                            this.snapshot.scan_id,
+                        );
                     }
 
                     if let Some(updates_tx) = updates_tx {
@@ -9151,6 +9230,11 @@ async fn compute_snapshot(
             this.snapshot.clone(),
         )
     });
+    log::info!(
+        "[fs-sync] computing git snapshot repo_id={id:?} work_directory={} prev_scan_id={}",
+        work_directory_abs_path.display(),
+        prev_snapshot.scan_id,
+    );
 
     let head_commit_future = {
         let backend = backend.clone();
@@ -9176,6 +9260,12 @@ async fn compute_snapshot(
         .await?;
     let branch = branches.iter().find(|branch| branch.is_head).cloned();
     let branch_list: Arc<[Branch]> = branches.into();
+    log::info!(
+        "[fs-sync] git snapshot loaded refs repo_id={id:?} branch={branch:?} head_present={} branch_count={} worktree_count={}",
+        head_commit.is_some(),
+        branch_list.len(),
+        all_worktrees.len(),
+    );
 
     let linked_worktrees: Arc<[GitWorktree]> = all_worktrees
         .into_iter()
@@ -9256,6 +9346,11 @@ async fn compute_snapshot(
             }
         })
         .await?;
+    let status_count = statuses.entries.len();
+    let diff_stat_count = diff_stats.entries.len();
+    log::info!(
+        "[fs-sync] git snapshot loaded status repo_id={id:?} status_count={status_count} diff_stat_count={diff_stat_count}",
+    );
 
     let diff_stat_map: HashMap<&RepoPath, DiffStat> =
         diff_stats.entries.iter().map(|(p, s)| (p, *s)).collect();
@@ -9288,10 +9383,16 @@ async fn compute_snapshot(
     log::debug!("new merge details: {merge_details:?}");
 
     Ok(this.update(cx, |this, cx| {
-        if conflicts_changed || statuses_by_path != this.snapshot.statuses_by_path {
+        let statuses_changed = conflicts_changed || statuses_by_path != this.snapshot.statuses_by_path;
+        let stash_entries_changed = stash_entries != this.snapshot.stash_entries;
+        log::info!(
+            "[fs-sync] git snapshot applying repo_id={id:?} statuses_changed={statuses_changed} conflicts_changed={conflicts_changed} stash_entries_changed={stash_entries_changed} status_count={status_count} old_scan_id={}",
+            this.snapshot.scan_id,
+        );
+        if statuses_changed {
             cx.emit(RepositoryEvent::StatusesChanged);
         }
-        if stash_entries != this.snapshot.stash_entries {
+        if stash_entries_changed {
             cx.emit(RepositoryEvent::StashEntriesChanged);
         }
 

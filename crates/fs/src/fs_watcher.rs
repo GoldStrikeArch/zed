@@ -138,6 +138,7 @@ fn push_notify_event(
     watched_root: &Path,
     event: &notify::Event,
 ) {
+    let raw_path_count = event.paths.len();
     let kind = match event.kind {
         EventKind::Create(_) => Some(PathEventKind::Created),
         EventKind::Modify(_) => Some(PathEventKind::Changed),
@@ -156,7 +157,8 @@ fn push_notify_event(
         })
         .collect::<Vec<_>>();
 
-    if event.need_rescan() {
+    let need_rescan = event.need_rescan();
+    if need_rescan {
         log::warn!("filesystem watcher lost sync for {watched_root:?}; scheduling rescan");
         path_events.retain(|path_event| path_event.path != watched_root);
         path_events.push(PathEvent {
@@ -165,6 +167,12 @@ fn push_notify_event(
         });
     }
 
+    log::info!(
+        "[fs-sync] normalized watcher event watched_root={watched_root:?} root={:?} raw_kind={:?} mapped_kind={kind:?} raw_paths={raw_path_count} retained_paths={} need_rescan={need_rescan} paths={path_events:?}",
+        root_path.as_path(),
+        event.kind,
+        path_events.len(),
+    );
     enqueue_path_events(tx, pending_path_events, path_events);
 }
 
@@ -459,13 +467,13 @@ fn handle_poll_event(event: Result<notify::Event, notify::Error>) {
 }
 
 fn handle_event(mode: WatcherMode, event: Result<notify::Event, notify::Error>) {
-    if matches!(
-        event,
-        Ok(Event {
-            kind: EventKind::Access(_),
-            ..
-        })
-    ) {
+    if let Ok(Event {
+        kind: EventKind::Access(_),
+        paths,
+        ..
+    }) = &event
+    {
+        log::info!("[fs-sync] dropping access watcher event mode={mode:?} paths={paths:?}");
         return;
     }
 

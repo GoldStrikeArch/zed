@@ -1214,6 +1214,12 @@ impl Fs for RealFs {
         } else {
             fs_watcher::WatcherMode::Native
         };
+        log::info!(
+            "[fs-sync] starting watcher path={} effective_watch_path={} mode={mode:?} latency_ms={}",
+            path.display(),
+            watch_path.display(),
+            latency.as_millis()
+        );
         let watcher: Arc<dyn Watcher> = Arc::new(fs_watcher::FsWatcher::new(
             tx.clone(),
             pending_paths.clone(),
@@ -1240,6 +1246,11 @@ impl Fs for RealFs {
                     target = SanitizedPath::new(&canonical).as_path().to_path_buf();
                 }
             }
+            log::info!(
+                "[fs-sync] adding symlink watcher path={} target={}",
+                path.display(),
+                target.display()
+            );
             watcher.add(&target).ok();
             if let Some(parent) = target.parent() {
                 watcher.add(parent).log_err();
@@ -1250,13 +1261,23 @@ impl Fs for RealFs {
             Box::pin(rx.filter_map({
                 let watcher = watcher.clone();
                 let executor = executor.clone();
+                let watched_path = path.to_path_buf();
                 move |_| {
                     let _ = watcher.clone();
                     let pending_paths = pending_paths.clone();
                     let executor = executor.clone();
+                    let watched_path = watched_path.clone();
                     async move {
                         executor.timer(latency).await;
                         let paths = std::mem::take(&mut *pending_paths.lock());
+                        if !paths.is_empty() {
+                            log::info!(
+                                "[fs-sync] emitting debounced watcher batch path={} latency_ms={} count={} paths={paths:?}",
+                                watched_path.display(),
+                                latency.as_millis(),
+                                paths.len(),
+                            );
+                        }
                         (!paths.is_empty()).then_some(paths)
                     }
                 }

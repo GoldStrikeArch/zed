@@ -1721,14 +1721,23 @@ impl GitRepository for RealGitRepository {
             Err(e) => return Task::ready(Err(e)),
         };
         let args = git_status_args(path_prefixes);
-        log::debug!("Checking for git status in {path_prefixes:?}");
+        log::info!(
+            "[fs-sync] invoking git status work_directory={} path_prefixes={path_prefixes:?} args={args:?}",
+            git.working_directory.display(),
+        );
         self.executor.spawn(async move {
             let output = git.build_command(&args).output().await?;
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout.parse()
+                let status: GitStatus = stdout.parse()?;
+                log::info!(
+                    "[fs-sync] git status command succeeded status_count={}",
+                    status.entries.len(),
+                );
+                Ok(status)
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                log::info!("[fs-sync] git status command failed stderr={stderr}");
                 anyhow::bail!("git status failed: {stderr}");
             }
         })

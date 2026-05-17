@@ -827,14 +827,22 @@ impl GitPanel {
                 window,
                 move |this, _git_store, event, window, cx| match event {
                     GitStoreEvent::RepositoryUpdated(
-                        _,
+                        repository_id,
                         RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
                         true,
-                    )
-                    | GitStoreEvent::RepositoryAdded
+                    ) => {
+                        log::info!(
+                            "[fs-sync] git panel scheduling visible entries update active_repository_id={repository_id:?}"
+                        );
+                        this.schedule_update(window, cx);
+                    }
+                    GitStoreEvent::RepositoryAdded
                     | GitStoreEvent::RepositoryRemoved(_)
                     | GitStoreEvent::GlobalConfigurationUpdated
                     | GitStoreEvent::ActiveRepositoryChanged(_) => {
+                        log::info!(
+                            "[fs-sync] git panel scheduling visible entries update after repository/global event"
+                        );
                         this.schedule_update(window, cx);
                     }
                     GitStoreEvent::IndexWriteError(error) => {

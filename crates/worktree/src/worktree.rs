@@ -1247,6 +1247,14 @@ impl LocalWorktree {
         cx: &mut Context<Worktree>,
     ) {
         let repo_changes = self.changed_repos(&self.snapshot, &mut new_snapshot);
+        log::info!(
+            "[fs-sync] applying worktree snapshot root={} scan_id={} completed_scan_id={} entry_changes={} repo_changes={}",
+            new_snapshot.abs_path.as_path().display(),
+            new_snapshot.scan_id,
+            new_snapshot.completed_scan_id,
+            entry_changes.len(),
+            repo_changes.len(),
+        );
 
         new_snapshot.root_repo_common_dir = new_snapshot
             .local_repo_for_work_directory_path(RelPath::empty())
@@ -3315,7 +3323,13 @@ impl BackgroundScannerState {
             .git_repositories
             .insert(work_directory_id, local_repository.clone());
 
-        log::trace!("inserting new local git repository");
+        log::info!(
+            "[fs-sync] inserted git repository work_directory_id={work_directory_id:?} work_directory_abs_path={} dot_git={} common_dir={} repository_dir={}",
+            local_repository.work_directory_abs_path.display(),
+            local_repository.dot_git_abs_path.display(),
+            local_repository.common_dir_abs_path.display(),
+            local_repository.repository_dir_abs_path.display(),
+        );
         Ok(local_repository)
     }
 }
@@ -3976,6 +3990,12 @@ impl BackgroundScanner {
             root_abs_path = state.snapshot.abs_path.clone();
             scanning_enabled = state.scanning_enabled;
         }
+        log::info!(
+            "[fs-sync] starting worktree scanner root={} scanning_enabled={scanning_enabled} defer_watch={} track_git_repositories={}",
+            root_abs_path.as_path().display(),
+            self.defer_watch,
+            self.track_git_repositories,
+        );
 
         // If the worktree root does not contain a git repository, then find
         // the git repository in an ancestor directory. Find any gitignore files
@@ -4095,6 +4115,12 @@ impl BackgroundScanner {
         {
             let mut state = self.state.lock().await;
             state.snapshot.completed_scan_id = state.snapshot.scan_id;
+            log::info!(
+                "[fs-sync] initial worktree scan complete root={} scan_id={} completed_scan_id={}",
+                root_abs_path.as_path().display(),
+                state.snapshot.scan_id,
+                state.snapshot.completed_scan_id,
+            );
         }
 
         self.send_status_update(false, SmallVec::new(), &[]).await;
@@ -4320,6 +4346,11 @@ impl BackgroundScanner {
 
     async fn process_events(&self, mut events: Vec<PathEvent>) {
         let root_path = self.state.lock().await.snapshot.abs_path.clone();
+        let incoming_event_count = events.len();
+        log::info!(
+            "[fs-sync] worktree received fs events root={} count={incoming_event_count} events={events:?}",
+            root_path.as_path().display(),
+        );
         let root_canonical_path = self.fs.canonicalize(root_path.as_path()).await;
         let root_canonical_path = match &root_canonical_path {
             Ok(path) => SanitizedPath::new(path),
@@ -4373,6 +4404,7 @@ impl BackgroundScanner {
             let state = self.state.lock().await;
             events = Self::normalized_events_for_worktree(&state, &root_canonical_path, events);
         }
+        let normalized_event_count = events.len();
 
         fn skip_ix(ranges: &mut SmallVec<[Range<usize>; 4]>, ix: usize) {
             if let Some(last_range) = ranges.last_mut()
@@ -4393,6 +4425,7 @@ impl BackgroundScanner {
 
         let mut dot_git_abs_paths = Vec::new();
         let mut work_dirs_needing_exclude_update = Vec::new();
+        let mut skipped_dot_git_events = 0usize;
 
         {
             let snapshot = &self.state.lock().await.snapshot;
@@ -4429,6 +4462,7 @@ impl BackgroundScanner {
                         log::debug!(
                             "ignoring event {abs_path:?} as it's in the .git directory among skipped files or directories"
                         );
+                        skipped_dot_git_events += 1;
                         skip_ix(&mut ranges_to_drop, ix);
                         continue;
                     }
@@ -4475,6 +4509,9 @@ impl BackgroundScanner {
         });
 
         let mut relative_paths = Vec::with_capacity(events.len());
+        let mut skipped_outside_root = 0usize;
+        let mut skipped_unloaded_parent = 0usize;
+        let mut skipped_excluded = 0usize;
 
         {
             let snapshot = &self.state.lock().await.snapshot;
@@ -4488,6 +4525,7 @@ impl BackgroundScanner {
                 {
                     path
                 } else {
+                    skipped_outside_root += 1;
                     skip_ix(&mut ranges_to_drop, ix);
                     continue;
                 };
@@ -4515,11 +4553,13 @@ impl BackgroundScanner {
                 });
                 if !parent_dir_is_loaded {
                     log::debug!("ignoring event {relative_path:?} within unloaded directory");
+                    skipped_unloaded_parent += 1;
                     skip_ix(&mut ranges_to_drop, ix);
                     continue;
                 }
 
                 if self.settings.is_path_excluded(&relative_path) {
+                    skipped_excluded += 1;
                     skip_ix(&mut ranges_to_drop, ix);
                     continue;
                 }
@@ -4535,7 +4575,27 @@ impl BackgroundScanner {
             }
         }
 
+        log::info!(
+            "[fs-sync] worktree normalized events root={} incoming={} normalized={} relative={} dot_git_roots={} skipped_dot_git={} skipped_outside_root={} skipped_unloaded_parent={} skipped_excluded={} relative_paths={:?} dot_git_paths={dot_git_abs_paths:?}",
+            root_path.as_path().display(),
+            incoming_event_count,
+            normalized_event_count,
+            relative_paths.len(),
+            dot_git_abs_paths.len(),
+            skipped_dot_git_events,
+            skipped_outside_root,
+            skipped_unloaded_parent,
+            skipped_excluded,
+            relative_paths
+                .iter()
+                .map(|event_root| &event_root.path)
+                .collect::<Vec<_>>(),
+        );
         if relative_paths.is_empty() && dot_git_abs_paths.is_empty() {
+            log::info!(
+                "[fs-sync] worktree dropping fs event batch root={} because no relative paths or git metadata paths remained",
+                root_path.as_path().display(),
+            );
             return;
         }
 
@@ -4552,15 +4612,22 @@ impl BackgroundScanner {
             }
         }
 
-        self.state.lock().await.snapshot.scan_id += 1;
+        let scan_id = {
+            let mut state = self.state.lock().await;
+            state.snapshot.scan_id += 1;
+            state.snapshot.scan_id
+        };
 
         let (scan_job_tx, scan_job_rx) = async_channel::unbounded();
-        log::debug!(
-            "received fs events {:?}",
+        log::info!(
+            "[fs-sync] worktree reloading event roots root={} scan_id={scan_id} relative_count={} dot_git_count={} relative_paths={:?} dot_git_paths={dot_git_abs_paths:?}",
+            root_path.as_path().display(),
+            relative_paths.len(),
+            dot_git_abs_paths.len(),
             relative_paths
                 .iter()
                 .map(|event_root| &event_root.path)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
         );
         self.reload_entries_for_paths(
             &root_path,
@@ -4765,6 +4832,14 @@ impl BackgroundScanner {
         );
         state.changed_paths.clear();
 
+        log::info!(
+            "[fs-sync] worktree status update root={} scan_id={} completed_scan_id={} scanning={scanning} merged_event_roots={} emitted_changes={} changes={changes:?}",
+            new_snapshot.abs_path.as_path().display(),
+            new_snapshot.scan_id,
+            new_snapshot.completed_scan_id,
+            merged_event_roots.len(),
+            changes.len(),
+        );
         self.status_updates_tx
             .unbounded_send(ScanState::Updated {
                 snapshot: new_snapshot,
@@ -5033,6 +5108,12 @@ impl BackgroundScanner {
         abs_paths: Vec<PathBuf>,
         scan_queue_tx: Option<Sender<ScanJob>>,
     ) {
+        let doing_recursive_update = scan_queue_tx.is_some();
+        log::info!(
+            "[fs-sync] reload entries requested root={} recursive={doing_recursive_update} relative_count={} relative_paths={relative_paths:?} abs_paths={abs_paths:?}",
+            root_abs_path.as_path().display(),
+            relative_paths.len(),
+        );
         // grab metadata for all requested paths
         let metadata = futures::future::join_all(
             abs_paths
@@ -5065,6 +5146,20 @@ impl BackgroundScanner {
         )
         .await;
 
+        let metadata_present = metadata
+            .iter()
+            .filter(|metadata| matches!(metadata, Ok(Some(_))))
+            .count();
+        let metadata_missing = metadata
+            .iter()
+            .filter(|metadata| matches!(metadata, Ok(None)))
+            .count();
+        let metadata_errors = metadata.iter().filter(|metadata| metadata.is_err()).count();
+        log::info!(
+            "[fs-sync] reload entries metadata root={} present={metadata_present} missing={metadata_missing} errors={metadata_errors}",
+            root_abs_path.as_path().display(),
+        );
+
         let mut new_ancestor_repo =
             if self.track_git_repositories && relative_paths.iter().any(|path| path.is_empty()) {
                 Some(discover_ancestor_git_repo(self.fs.clone(), &root_abs_path).await)
@@ -5073,7 +5168,6 @@ impl BackgroundScanner {
             };
 
         let mut state = self.state.lock().await;
-        let doing_recursive_update = scan_queue_tx.is_some();
 
         // Remove any entries for paths that no longer exist or are being recursively
         // refreshed. Do this before adding any new entries, so that renames can be
@@ -5178,6 +5272,13 @@ impl BackgroundScanner {
             relative_paths.iter().cloned(),
             usize::MAX,
             Ord::cmp,
+        );
+        log::info!(
+            "[fs-sync] reload entries updated state root={} requested={} changed_paths_count={} changed_paths={:?}",
+            root_abs_path.as_path().display(),
+            relative_paths.len(),
+            state.changed_paths.len(),
+            state.changed_paths,
         );
     }
 
@@ -5456,7 +5557,10 @@ impl BackgroundScanner {
     }
 
     async fn update_git_repositories(&self, dot_git_paths: Vec<PathBuf>) -> Vec<Arc<Path>> {
-        log::trace!("reloading repositories: {dot_git_paths:?}");
+        log::info!(
+            "[fs-sync] updating git repositories dot_git_count={} dot_git_paths={dot_git_paths:?}",
+            dot_git_paths.len(),
+        );
         let mut state = self.state.lock().await;
         let scan_id = state.snapshot.scan_id;
         let mut affected_repo_roots = Vec::new();
@@ -5488,8 +5592,17 @@ impl BackgroundScanner {
                         // a rescan of a linked worktree's commondir arrives
                         // after the worktree's repository has already been
                         // unregistered.
+                        log::info!(
+                            "[fs-sync] ignoring git metadata path outside worktree root dot_git_path={} root={}",
+                            dot_git_dir.display(),
+                            state.snapshot.abs_path().display(),
+                        );
                         continue;
                     };
+                    log::info!(
+                        "[fs-sync] registering git repository from metadata event dot_git_path={} relative={relative:?}",
+                        dot_git_dir.display(),
+                    );
                     affected_repo_roots.push(dot_git_dir.parent().unwrap().into());
                     state
                         .insert_git_repository(
@@ -5502,6 +5615,12 @@ impl BackgroundScanner {
                         .await;
                 }
                 Some(local_repository) => {
+                    log::info!(
+                        "[fs-sync] marking git repository metadata changed work_directory_id={:?} work_directory_abs_path={} dot_git_path={} scan_id={scan_id}",
+                        local_repository.work_directory_id,
+                        local_repository.work_directory_abs_path.display(),
+                        dot_git_dir.display(),
+                    );
                     state.snapshot.git_repositories.update(
                         &local_repository.work_directory_id,
                         |entry| {
@@ -5548,6 +5667,10 @@ impl BackgroundScanner {
                 preserve
             });
 
+        log::info!(
+            "[fs-sync] git repository update complete scan_id={scan_id} repository_count={} affected_repo_roots={affected_repo_roots:?}",
+            snapshot.git_repositories.iter().count(),
+        );
         affected_repo_roots
     }
 

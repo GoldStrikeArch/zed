@@ -599,9 +599,21 @@ impl ProjectPanel {
                 &git_store,
                 window,
                 |this, _, event, window, cx| match event {
-                    GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::StatusesChanged, _)
-                    | GitStoreEvent::RepositoryAdded
-                    | GitStoreEvent::RepositoryRemoved(_) => {
+                    GitStoreEvent::RepositoryUpdated(
+                        repository_id,
+                        RepositoryEvent::StatusesChanged,
+                        is_active,
+                    ) => {
+                        log::info!(
+                            "[fs-sync] project panel received git status update repository_id={repository_id:?} is_active={is_active}"
+                        );
+                        this.update_visible_entries(None, false, false, window, cx);
+                        cx.notify();
+                    }
+                    GitStoreEvent::RepositoryAdded | GitStoreEvent::RepositoryRemoved(_) => {
+                        log::info!(
+                            "[fs-sync] project panel received git repository list update"
+                        );
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
                     }
@@ -666,9 +678,18 @@ impl ProjectPanel {
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
                     }
-                    project::Event::WorktreeUpdatedEntries(_, _)
-                    | project::Event::WorktreeAdded(_)
-                    | project::Event::WorktreeOrderChanged => {
+                    project::Event::WorktreeUpdatedEntries(worktree_id, changes) => {
+                        log::info!(
+                            "[fs-sync] project panel received worktree entries worktree_id={worktree_id:?} change_count={}",
+                            changes.len(),
+                        );
+                        this.update_visible_entries(None, false, false, window, cx);
+                        cx.notify();
+                    }
+                    project::Event::WorktreeAdded(_) | project::Event::WorktreeOrderChanged => {
+                        log::info!(
+                            "[fs-sync] project panel received worktree list/order update"
+                        );
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
                     }

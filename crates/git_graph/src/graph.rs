@@ -255,6 +255,7 @@ pub(super) struct GraphData {
     lane_states: SmallVec<[LaneState; 8]>,
     lane_colors: HashMap<ActiveLaneIdx, BranchColor>,
     parent_to_lanes: HashMap<Oid, SmallVec<[usize; 1]>>,
+    default_branch_names: SmallVec<[String; 2]>,
     default_branch_next_commit: Option<Oid>,
     next_color: BranchColor,
     accent_colors_count: usize,
@@ -270,6 +271,7 @@ impl GraphData {
             lane_states: SmallVec::default(),
             lane_colors: HashMap::default(),
             parent_to_lanes: HashMap::default(),
+            default_branch_names: fallback_default_branch_names(),
             default_branch_next_commit: None,
             next_color: BranchColor(0),
             accent_colors_count,
@@ -290,6 +292,17 @@ impl GraphData {
         self.next_color = BranchColor(0);
         self.max_commit_count = AllCommitCount::NotLoaded;
         self.max_lanes = 0;
+    }
+
+    pub(super) fn set_default_branch(&mut self, default_branch: Option<String>) {
+        self.default_branch_names.clear();
+        if let Some(default_branch) = default_branch.filter(|branch| !branch.is_empty()) {
+            self.default_branch_names.push(default_branch);
+        } else {
+            self.default_branch_names = fallback_default_branch_names();
+        }
+
+        self.default_branch_next_commit = None;
     }
 
     pub(super) fn add_commits(&mut self, commits: &[Arc<InitialGraphCommitData>]) {
@@ -320,7 +333,7 @@ impl GraphData {
 
         let Some(default_branch_head) = commits
             .iter()
-            .find(|commit| has_default_branch_ref(commit))
+            .find(|commit| has_default_branch_ref(commit, &self.default_branch_names))
             .map(|commit| commit.sha)
         else {
             return;
@@ -517,39 +530,62 @@ impl GraphData {
     }
 }
 
-fn has_default_branch_ref(commit: &InitialGraphCommitData) -> bool {
-    commit
-        .ref_names
-        .iter()
-        .any(|ref_name| is_default_branch_ref(ref_name.as_ref()))
+fn fallback_default_branch_names() -> SmallVec<[String; 2]> {
+    smallvec!["main".to_string(), "master".to_string()]
 }
 
-fn is_default_branch_ref(ref_name: &str) -> bool {
+fn has_default_branch_ref(
+    commit: &InitialGraphCommitData,
+    default_branch_names: &[String],
+) -> bool {
+    commit.ref_names.iter().any(|ref_name| {
+        default_branch_names
+            .iter()
+            .any(|default_branch| is_default_branch_ref(ref_name.as_ref(), default_branch))
+    })
+}
+
+fn is_default_branch_ref(ref_name: &str, default_branch: &str) -> bool {
+    if default_branch.is_empty() {
+        return false;
+    }
+
     if ref_name.starts_with("tag: ") {
         return false;
     }
 
-    if matches!(
-        ref_name,
-        "main" | "master" | "refs/heads/main" | "refs/heads/master"
-    ) {
+    let default_branch = normalize_branch_ref(default_branch);
+
+    if ref_name == default_branch {
         return true;
     }
 
     if let Some(head_ref) = ref_name.strip_prefix("HEAD -> ") {
-        return is_default_branch_ref(head_ref);
+        return is_default_branch_ref(head_ref, default_branch);
+    }
+
+    if ref_name.strip_prefix("refs/heads/") == Some(default_branch) {
+        return true;
     }
 
     if let Some(remote_ref) = ref_name.strip_prefix("refs/remotes/") {
-        return remote_ref
-            .rsplit_once('/')
-            .is_some_and(|(_, branch)| matches!(branch, "main" | "master"));
+        return remote_ref == default_branch
+            || remote_ref
+                .split_once('/')
+                .is_some_and(|(_, branch)| branch == default_branch);
     }
 
-    matches!(
-        ref_name,
-        "origin/main" | "origin/master" | "upstream/main" | "upstream/master"
-    )
+    ref_name
+        .strip_prefix("origin/")
+        .or_else(|| ref_name.strip_prefix("upstream/"))
+        .is_some_and(|remote_branch| remote_branch == default_branch)
+}
+
+fn normalize_branch_ref(branch: &str) -> &str {
+    branch
+        .strip_prefix("refs/heads/")
+        .or_else(|| branch.strip_prefix("refs/remotes/"))
+        .unwrap_or(branch)
 }
 
 #[cfg(test)]
@@ -1282,18 +1318,95 @@ mod tests {
     }
 
     #[test]
-    fn test_default_branch_ref_detection() {
-        assert!(is_default_branch_ref("main"));
-        assert!(is_default_branch_ref("master"));
-        assert!(is_default_branch_ref("HEAD -> main"));
-        assert!(is_default_branch_ref("refs/heads/master"));
-        assert!(is_default_branch_ref("origin/main"));
-        assert!(is_default_branch_ref("upstream/master"));
-        assert!(is_default_branch_ref("refs/remotes/fork/main"));
+    fn test_graph_configured_default_branch_stays_on_leftmost_lane() {
+        let mut rng = StdRng::seed_from_u64(42);
 
-        assert!(!is_default_branch_ref("feature/main"));
-        assert!(!is_default_branch_ref("tag: release/main"));
-        assert!(!is_default_branch_ref("origin/HEAD"));
+        let side_branch = Oid::random(&mut rng);
+        let default_head = Oid::random(&mut rng);
+        let default_parent = Oid::random(&mut rng);
+
+        let commits = vec![
+            Arc::new(InitialGraphCommitData {
+                sha: side_branch,
+                parents: smallvec![default_head],
+                ref_names: vec!["feature".into()],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: default_head,
+                parents: smallvec![default_parent],
+                ref_names: vec!["origin/dev".into()],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: default_parent,
+                parents: smallvec![],
+                ref_names: vec![],
+            }),
+        ];
+
+        let mut graph_data = GraphData::new(8);
+        graph_data.set_default_branch(Some("origin/dev".to_string()));
+        graph_data.add_commits(&commits);
+
+        verify_all_invariants_for_test(&graph_data, &commits)
+            .expect("graph invariants should hold");
+
+        assert_eq!(commit_lane(&graph_data, side_branch), Some(1));
+        assert_eq!(commit_lane(&graph_data, default_head), Some(0));
+        assert_eq!(commit_lane(&graph_data, default_parent), Some(0));
+    }
+
+    #[test]
+    fn test_graph_configured_default_branch_replaces_main_master_fallback() {
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let main_head = Oid::random(&mut rng);
+        let default_head = Oid::random(&mut rng);
+        let default_parent = Oid::random(&mut rng);
+
+        let commits = vec![
+            Arc::new(InitialGraphCommitData {
+                sha: main_head,
+                parents: smallvec![default_head],
+                ref_names: vec!["main".into()],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: default_head,
+                parents: smallvec![default_parent],
+                ref_names: vec!["HEAD -> dev".into()],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: default_parent,
+                parents: smallvec![],
+                ref_names: vec![],
+            }),
+        ];
+
+        let mut graph_data = GraphData::new(8);
+        graph_data.set_default_branch(Some("dev".to_string()));
+        graph_data.add_commits(&commits);
+
+        verify_all_invariants_for_test(&graph_data, &commits)
+            .expect("graph invariants should hold");
+
+        assert_eq!(commit_lane(&graph_data, main_head), Some(1));
+        assert_eq!(commit_lane(&graph_data, default_head), Some(0));
+        assert_eq!(commit_lane(&graph_data, default_parent), Some(0));
+    }
+
+    #[test]
+    fn test_default_branch_ref_detection() {
+        assert!(is_default_branch_ref("dev", "dev"));
+        assert!(is_default_branch_ref("HEAD -> dev", "dev"));
+        assert!(is_default_branch_ref("refs/heads/dev", "dev"));
+        assert!(is_default_branch_ref("origin/dev", "dev"));
+        assert!(is_default_branch_ref("upstream/release/dev", "release/dev"));
+        assert!(is_default_branch_ref("refs/remotes/fork/dev", "dev"));
+        assert!(is_default_branch_ref("refs/remotes/fork/dev", "fork/dev"));
+
+        assert!(!is_default_branch_ref("main", "dev"));
+        assert!(!is_default_branch_ref("feature/dev", "dev"));
+        assert!(!is_default_branch_ref("tag: release/dev", "dev"));
+        assert!(!is_default_branch_ref("origin/HEAD", "dev"));
     }
 
     fn commit_lane(graph_data: &GraphData, commit: Oid) -> Option<usize> {

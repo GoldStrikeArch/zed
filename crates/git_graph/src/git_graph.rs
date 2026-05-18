@@ -644,6 +644,9 @@ pub struct GitGraph {
     log_order: LogOrder,
     selected_commit_diff: Option<CommitDiff>,
     selected_commit_diff_stats: Option<(usize, usize)>,
+    is_default_branch_loaded: bool,
+    default_branch_load_id: usize,
+    _default_branch_task: Option<Task<()>>,
     _commit_diff_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
     repo_id: RepositoryId,
@@ -658,6 +661,7 @@ impl GitGraph {
         self.search_state.selected_index = None;
         self.search_state.state.next_state();
         self.context_menu = None;
+        self.load_default_branch_and_fetch_initial_graph_data(cx);
         cx.emit(ItemEvent::Edit);
         cx.notify();
     }
@@ -821,6 +825,9 @@ impl GitGraph {
             },
             workspace,
             graph_data: graph,
+            is_default_branch_loaded: false,
+            default_branch_load_id: 0,
+            _default_branch_task: None,
             _commit_diff_task: None,
             context_menu: None,
             table_interaction_state,
@@ -838,7 +845,7 @@ impl GitGraph {
             pending_select_sha: None,
         };
 
-        this.fetch_initial_graph_data(cx);
+        this.load_default_branch_and_fetch_initial_graph_data(cx);
         this
     }
 
@@ -854,15 +861,15 @@ impl GitGraph {
             {
                 match event {
                     GitGraphEvent::FullyLoaded => {
-                        if let Some(pending_sha_index) =
-                            self.pending_select_sha.take().and_then(|oid| {
-                                repository
-                                    .read(cx)
-                                    .get_graph_data(source.clone(), *order)
-                                    .and_then(|data| data.commit_oid_to_index.get(&oid).copied())
-                            })
-                        {
+                        if let Some(pending_sha_index) = self.pending_select_sha.and_then(|oid| {
+                            repository
+                                .read(cx)
+                                .get_graph_data(source.clone(), *order)
+                                .and_then(|data| data.commit_oid_to_index.get(&oid).copied())
+                                .filter(|index| *index < self.graph_data.commits.len())
+                        }) {
                             self.select_entry(pending_sha_index, ScrollStrategy::Nearest, cx);
+                            self.pending_select_sha.take();
                         }
                     }
                     GitGraphEvent::LoadingError => {
@@ -927,14 +934,66 @@ impl GitGraph {
         }
     }
 
-    fn fetch_initial_graph_data(&mut self, cx: &mut App) {
+    fn load_default_branch_and_fetch_initial_graph_data(&mut self, cx: &mut Context<Self>) {
+        self.is_default_branch_loaded = false;
+        self.default_branch_load_id += 1;
+
+        let Some(repository) = self.get_repository(cx) else {
+            self.graph_data.set_default_branch(None);
+            self.is_default_branch_loaded = true;
+            return;
+        };
+
+        let repo_id = self.repo_id;
+        let load_id = self.default_branch_load_id;
+        let default_branch = repository.update(cx, |repository, _| repository.default_branch(true));
+
+        self._default_branch_task = Some(cx.spawn(async move |this, cx| {
+            let default_branch = default_branch
+                .await
+                .ok()
+                .and_then(|result| result.ok())
+                .flatten();
+
+            this.update(cx, |this, cx| {
+                if this.repo_id != repo_id || this.default_branch_load_id != load_id {
+                    return;
+                }
+
+                this.graph_data
+                    .set_default_branch(default_branch.map(|branch| branch.to_string()));
+                this.is_default_branch_loaded = true;
+                this.fetch_initial_graph_data(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn fetch_initial_graph_data(&mut self, cx: &mut Context<Self>) {
+        if !self.is_default_branch_loaded {
+            return;
+        }
+
         if let Some(repository) = self.get_repository(cx) {
-            repository.update(cx, |repository, cx| {
+            let pending_selection_index = repository.update(cx, |repository, cx| {
                 let commits = repository
                     .graph_data(self.log_source.clone(), self.log_order, 0..usize::MAX, cx)
                     .commits;
                 self.graph_data.add_commits(commits);
+
+                self.pending_select_sha.and_then(|oid| {
+                    repository
+                        .get_graph_data(self.log_source.clone(), self.log_order)
+                        .and_then(|data| data.commit_oid_to_index.get(&oid).copied())
+                        .filter(|index| *index < self.graph_data.commits.len())
+                })
             });
+
+            if let Some(pending_selection_index) = pending_selection_index {
+                self.select_entry(pending_selection_index, ScrollStrategy::Nearest, cx);
+                self.pending_select_sha.take();
+            }
         }
     }
 
@@ -1430,6 +1489,11 @@ impl GitGraph {
                 this.pending_select_sha = Some(oid);
                 return;
             };
+
+            if index >= this.graph_data.commits.len() {
+                this.pending_select_sha = Some(oid);
+                return;
+            }
 
             this.pending_select_sha = None;
             this.select_entry(index, ScrollStrategy::Center, cx);
@@ -2437,6 +2501,9 @@ impl Render for GitGraph {
         }
         let (commit_count, is_loading) = match self.graph_data.max_commit_count {
             AllCommitCount::Loaded(count) => (count, true),
+            AllCommitCount::NotLoaded if !self.is_default_branch_loaded => {
+                (self.graph_data.commits.len(), true)
+            }
             AllCommitCount::NotLoaded => {
                 let (commit_count, is_loading) = if let Some(repository) = self.get_repository(cx) {
                     repository.update(cx, |repository, cx| {

@@ -255,6 +255,7 @@ pub(super) struct GraphData {
     lane_states: SmallVec<[LaneState; 8]>,
     lane_colors: HashMap<ActiveLaneIdx, BranchColor>,
     parent_to_lanes: HashMap<Oid, SmallVec<[usize; 1]>>,
+    default_branch_next_commit: Option<Oid>,
     next_color: BranchColor,
     accent_colors_count: usize,
     pub(super) commits: Vec<Rc<CommitEntry>>,
@@ -269,6 +270,7 @@ impl GraphData {
             lane_states: SmallVec::default(),
             lane_colors: HashMap::default(),
             parent_to_lanes: HashMap::default(),
+            default_branch_next_commit: None,
             next_color: BranchColor(0),
             accent_colors_count,
             commits: Vec::default(),
@@ -282,6 +284,7 @@ impl GraphData {
         self.lane_states.clear();
         self.lane_colors.clear();
         self.parent_to_lanes.clear();
+        self.default_branch_next_commit = None;
         self.commits.clear();
         self.lines.clear();
         self.next_color = BranchColor(0);
@@ -292,6 +295,7 @@ impl GraphData {
     pub(super) fn add_commits(&mut self, commits: &[Arc<InitialGraphCommitData>]) {
         self.commits.reserve(commits.len());
         self.lines.reserve(commits.len() / 2);
+        self.reserve_default_branch_lane(commits);
 
         for commit in commits.iter() {
             let commit_row = self.commits.len();
@@ -300,6 +304,7 @@ impl GraphData {
 
             self.close_pending_lanes(commit.sha, commit_row, commit_lane, commit_color);
             self.open_parent_lanes(commit, commit_row, commit_lane, commit_color);
+            self.advance_default_branch(commit);
 
             self.max_lanes = self.max_lanes.max(self.lane_states.len());
             self.push_commit(commit.clone(), commit_lane, commit_color);
@@ -308,7 +313,39 @@ impl GraphData {
         self.max_commit_count = AllCommitCount::Loaded(self.commits.len());
     }
 
+    fn reserve_default_branch_lane(&mut self, commits: &[Arc<InitialGraphCommitData>]) {
+        if self.default_branch_next_commit.is_some() {
+            return;
+        }
+
+        let Some(default_branch_head) = commits
+            .iter()
+            .find(|commit| has_default_branch_ref(commit))
+            .map(|commit| commit.sha)
+        else {
+            return;
+        };
+
+        if self
+            .lane_states
+            .first()
+            .is_some_and(|lane| !lane.is_empty())
+        {
+            return;
+        }
+
+        self.default_branch_next_commit = Some(default_branch_head);
+        if self.lane_states.is_empty() {
+            self.lane_states.push(LaneState::Empty);
+        }
+    }
+
     fn next_commit_lane(&mut self, commit: Oid) -> ActiveLaneIdx {
+        if self.default_branch_next_commit == Some(commit) {
+            self.ensure_lane_exists(0);
+            return 0;
+        }
+
         self.parent_to_lanes
             .get(&commit)
             .and_then(|lanes| lanes.iter().min().copied())
@@ -402,6 +439,14 @@ impl GraphData {
         }));
     }
 
+    fn advance_default_branch(&mut self, commit: &InitialGraphCommitData) {
+        if self.default_branch_next_commit != Some(commit.sha) {
+            return;
+        }
+
+        self.default_branch_next_commit = commit.parents.first().copied();
+    }
+
     fn avoid_overlapping_merge_curve(
         commits: &[Rc<CommitEntry>],
         state: &mut LaneState,
@@ -442,11 +487,24 @@ impl GraphData {
     fn first_empty_lane_idx(&mut self) -> ActiveLaneIdx {
         self.lane_states
             .iter()
-            .position(LaneState::is_empty)
+            .enumerate()
+            .find_map(|(lane, state)| {
+                if self.default_branch_next_commit.is_some() && lane == 0 {
+                    return None;
+                }
+
+                state.is_empty().then_some(lane)
+            })
             .unwrap_or_else(|| {
                 self.lane_states.push(LaneState::Empty);
                 self.lane_states.len() - 1
             })
+    }
+
+    fn ensure_lane_exists(&mut self, lane: ActiveLaneIdx) {
+        while self.lane_states.len() <= lane {
+            self.lane_states.push(LaneState::Empty);
+        }
     }
 
     fn get_lane_color(&mut self, lane_idx: ActiveLaneIdx) -> BranchColor {
@@ -457,6 +515,41 @@ impl GraphData {
             color_idx
         })
     }
+}
+
+fn has_default_branch_ref(commit: &InitialGraphCommitData) -> bool {
+    commit
+        .ref_names
+        .iter()
+        .any(|ref_name| is_default_branch_ref(ref_name.as_ref()))
+}
+
+fn is_default_branch_ref(ref_name: &str) -> bool {
+    if ref_name.starts_with("tag: ") {
+        return false;
+    }
+
+    if matches!(
+        ref_name,
+        "main" | "master" | "refs/heads/main" | "refs/heads/master"
+    ) {
+        return true;
+    }
+
+    if let Some(head_ref) = ref_name.strip_prefix("HEAD -> ") {
+        return is_default_branch_ref(head_ref);
+    }
+
+    if let Some(remote_ref) = ref_name.strip_prefix("refs/remotes/") {
+        return remote_ref
+            .rsplit_once('/')
+            .is_some_and(|(_, branch)| matches!(branch, "main" | "master"));
+    }
+
+    matches!(
+        ref_name,
+        "origin/main" | "origin/master" | "upstream/main" | "upstream/master"
+    )
 }
 
 #[cfg(test)]
@@ -1112,5 +1205,102 @@ mod tests {
         };
 
         assert_eq!(*to_column, 1);
+    }
+
+    #[test]
+    fn test_graph_main_branch_stays_on_leftmost_lane_when_side_branch_is_newer() {
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let side_branch = Oid::random(&mut rng);
+        let main_head = Oid::random(&mut rng);
+        let main_parent = Oid::random(&mut rng);
+
+        let commits = vec![
+            Arc::new(InitialGraphCommitData {
+                sha: side_branch,
+                parents: smallvec![main_head],
+                ref_names: vec!["gh-mutex".into()],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: main_head,
+                parents: smallvec![main_parent],
+                ref_names: vec!["HEAD -> main".into(), "origin/main".into()],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: main_parent,
+                parents: smallvec![],
+                ref_names: vec![],
+            }),
+        ];
+
+        let mut graph_data = GraphData::new(8);
+        graph_data.add_commits(&commits);
+
+        verify_all_invariants_for_test(&graph_data, &commits)
+            .expect("graph invariants should hold");
+
+        assert_eq!(commit_lane(&graph_data, side_branch), Some(1));
+        assert_eq!(commit_lane(&graph_data, main_head), Some(0));
+        assert_eq!(commit_lane(&graph_data, main_parent), Some(0));
+    }
+
+    #[test]
+    fn test_graph_master_branch_stays_on_leftmost_lane_when_side_branch_is_newer() {
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let side_branch = Oid::random(&mut rng);
+        let master_head = Oid::random(&mut rng);
+        let master_parent = Oid::random(&mut rng);
+
+        let commits = vec![
+            Arc::new(InitialGraphCommitData {
+                sha: side_branch,
+                parents: smallvec![master_head],
+                ref_names: vec!["feature".into()],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: master_head,
+                parents: smallvec![master_parent],
+                ref_names: vec!["refs/heads/master".into()],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: master_parent,
+                parents: smallvec![],
+                ref_names: vec![],
+            }),
+        ];
+
+        let mut graph_data = GraphData::new(8);
+        graph_data.add_commits(&commits);
+
+        verify_all_invariants_for_test(&graph_data, &commits)
+            .expect("graph invariants should hold");
+
+        assert_eq!(commit_lane(&graph_data, side_branch), Some(1));
+        assert_eq!(commit_lane(&graph_data, master_head), Some(0));
+        assert_eq!(commit_lane(&graph_data, master_parent), Some(0));
+    }
+
+    #[test]
+    fn test_default_branch_ref_detection() {
+        assert!(is_default_branch_ref("main"));
+        assert!(is_default_branch_ref("master"));
+        assert!(is_default_branch_ref("HEAD -> main"));
+        assert!(is_default_branch_ref("refs/heads/master"));
+        assert!(is_default_branch_ref("origin/main"));
+        assert!(is_default_branch_ref("upstream/master"));
+        assert!(is_default_branch_ref("refs/remotes/fork/main"));
+
+        assert!(!is_default_branch_ref("feature/main"));
+        assert!(!is_default_branch_ref("tag: release/main"));
+        assert!(!is_default_branch_ref("origin/HEAD"));
+    }
+
+    fn commit_lane(graph_data: &GraphData, commit: Oid) -> Option<usize> {
+        graph_data
+            .commits
+            .iter()
+            .find(|entry| entry.data.sha == commit)
+            .map(|entry| entry.lane)
     }
 }

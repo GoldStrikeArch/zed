@@ -401,7 +401,7 @@ impl Worktree {
 
         let fs_case_sensitive = fs.is_case_sensitive().await;
 
-        let root_file_handle = if metadata.as_ref().is_some() {
+        let root_file_handle = if visible && metadata.as_ref().is_some() {
             fs.open_handle(&abs_path)
                 .await
                 .with_context(|| {
@@ -412,6 +412,12 @@ impl Worktree {
                 })
                 .log_err()
         } else {
+            if !visible && metadata.as_ref().is_some() {
+                log::debug!(
+                    "not holding root file handle for invisible worktree at {}",
+                    abs_path.display()
+                );
+            }
             None
         };
 
@@ -1154,6 +1160,7 @@ impl LocalWorktree {
         let fs = self.fs.clone();
         let scanning_enabled = self.scanning_enabled;
         let force_defer_watch = self.force_defer_watch;
+        let visible = self.visible;
         let track_git_repositories = self.visible;
         let settings = self.settings.clone();
         let (scan_states_tx, mut scan_states_rx) = mpsc::unbounded();
@@ -1161,12 +1168,19 @@ impl LocalWorktree {
             let abs_path = snapshot.abs_path.as_path().to_path_buf();
             let background = cx.background_executor().clone();
             async move {
+                let watch_enabled = visible && scanning_enabled;
                 let defer_watch =
-                    force_defer_watch || (scanning_enabled && fs::requires_poll_watcher(&abs_path));
+                    watch_enabled && (force_defer_watch || fs::requires_poll_watcher(&abs_path));
 
-                let (events, watcher) = if scanning_enabled && !defer_watch {
+                let (events, watcher) = if watch_enabled && !defer_watch {
                     fs.watch(&abs_path, FS_WATCH_LATENCY).await
                 } else {
+                    if scanning_enabled && !visible {
+                        log::debug!(
+                            "not starting filesystem watcher for invisible worktree at {}",
+                            abs_path.display()
+                        );
+                    }
                     (Box::pin(stream::pending()) as _, Arc::new(NullWatcher) as _)
                 };
                 let fs_case_sensitive = fs.is_case_sensitive().await;
@@ -1195,6 +1209,7 @@ impl LocalWorktree {
                     phase: BackgroundScannerPhase::InitialScan,
                     share_private_files,
                     settings,
+                    visible,
                     watcher,
                     track_git_repositories,
                     is_single_file,
@@ -3967,6 +3982,7 @@ struct BackgroundScanner {
     watcher: Arc<dyn Watcher>,
     settings: WorktreeSettings,
     share_private_files: bool,
+    visible: bool,
     track_git_repositories: bool,
     /// Whether this is a single-file worktree (root is a file, not a directory).
     /// Used to determine if we should give up after repeated canonicalization failures.
@@ -4125,7 +4141,7 @@ impl BackgroundScanner {
 
         self.send_status_update(false, SmallVec::new(), &[]).await;
 
-        if self.defer_watch {
+        if self.visible && self.defer_watch {
             let (events, watcher) = self
                 .fs
                 .watch(root_abs_path.as_path(), FS_WATCH_LATENCY)
@@ -4406,6 +4422,8 @@ impl BackgroundScanner {
         }
         let normalized_event_count = events.len();
 
+        log::debug!("raw events for process_events: {events:?}");
+
         fn skip_ix(ranges: &mut SmallVec<[Range<usize>; 4]>, ix: usize) {
             if let Some(last_range) = ranges.last_mut()
                 && last_range.end == ix
@@ -4451,14 +4469,12 @@ impl BackgroundScanner {
                 }
 
                 if let Some((dot_git_abs_path, path_in_git_dir)) = dot_git_paths {
-                    let skip = skipped_files_in_dot_git.iter().any(|skipped| {
+                    let is_ignored = skipped_files_in_dot_git.iter().any(|skipped| {
                         OsStr::new(skipped) == path_in_git_dir.as_path().as_os_str()
                     }) || skipped_dirs_in_dot_git
                         .iter()
-                        .any(|skipped_git_subdir| path_in_git_dir.starts_with(skipped_git_subdir))
-                        || path_in_git_dir == Path::new("")
-                            && self.fs.is_dir(&dot_git_abs_path).await;
-                    if skip {
+                        .any(|skipped_git_subdir| path_in_git_dir.starts_with(skipped_git_subdir));
+                    if is_ignored {
                         log::debug!(
                             "ignoring event {abs_path:?} as it's in the .git directory among skipped files or directories"
                         );
